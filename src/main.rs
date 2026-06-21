@@ -1,31 +1,32 @@
-use anyhow::{Context, Result};
-use fakeroot_rs::FakerootCommandExt;
-use fakeroot_rs::loginshell;
-use nix::unistd::getuid;
-use std::env;
-use std::process::Command;
+//! Tiny CLI shim over the `fakeroot` library.
+//!
+//! Runs a single command under fakeroot and propagates its exit code. This is
+//! deliberately minimal — the full `fakeroot`-compatible CLI (login shell,
+//! `-s/-i/-u/-b`, environment compatibility) is a separate effort.
 
-fn main() -> Result<()> {
-    let mut args = env::args().skip(1);
-    let (cmd_name, cmd_args) = if let Some(name) = args.next() {
-        (name, args.collect::<Vec<_>>())
-    } else {
-        let uid = getuid().as_raw();
-        let shell = loginshell::get_login_shell(uid).context("Failed to get login shell")?;
-        (shell, vec![])
+use fakeroot::{FakerootCommandExt, Options};
+use std::process::{Command, ExitCode};
+
+fn main() -> ExitCode {
+    env_logger::init();
+
+    let mut args = std::env::args_os().skip(1);
+    let Some(program) = args.next() else {
+        eprintln!("usage: fakeroot-rs <program> [args...]");
+        return ExitCode::from(2);
+    };
+    let rest: Vec<_> = args.collect();
+
+    // Enable per-syscall debug instrumentation when RUST_LOG is set.
+    let opts = Options {
+        debug: std::env::var_os("RUST_LOG").is_some(),
     };
 
-    let mut cmd = Command::new(&cmd_name);
-    let status = cmd
-        .args(&cmd_args)
-        .fakeroot()?
-        .status()
-        .with_context(|| format!("Failed to execute command: {}", cmd_name))?;
-
-    if let Some(code) = status.code() {
-        std::process::exit(code);
-    } else {
-        eprintln!("Command terminated by signal");
-        std::process::exit(1);
+    match Command::new(program).args(rest).fakeroot_status_with(opts) {
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(e) => {
+            eprintln!("fakeroot-rs: {e}");
+            ExitCode::from(1)
+        }
     }
 }

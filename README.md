@@ -1,75 +1,83 @@
-# `fakeroot-rs`
+# fakeroot-rs
 
-[![Crates.io](https://img.shields.io/crates/v/fakeroot-rs.svg)](https://crates.io/crates/fakeroot-rs)
+A [`fakeroot`](https://wiki.debian.org/fakeroot)-style fake-root environment for
+Linux, built on **ptrace** narrowed by a self-installed **seccomp `RET_TRACE`**
+filter. It lets an unprivileged process believe it is root and see whatever file
+ownership it sets — without ever changing anything on disk.
 
-A Rust-native implementation of `fakeroot`, using Linux user namespaces to run commands in an environment where it appears to have root privileges.
+It exists to fix two things the classic fakeroot can't do in modern setups:
 
-This crate provides both a library for programmatic use in your own Rust projects and a standalone CLI binary.
+- **Static binaries.** Classic fakeroot is an `LD_PRELOAD` shim, so it's invisible
+  to statically-linked programs (Go, musl, static Rust) and to anything that issues
+  raw syscalls. fakeroot-rs intercepts at the **syscall boundary**, so linking
+  doesn't matter.
+- **Locked-down Docker / CI.** It needs **no extra privileges** and works under
+  Docker's **default seccomp profile**: installing a seccomp filter via `prctl` and
+  ptracing your own children are both permitted there, whereas the user-namespace
+  approach (`clone(CLONE_NEWUSER)`) is blocked.
 
-## Library Usage
+## How it works
 
-To use this library, add it to your `Cargo.toml`. For a cleaner API, it's recommended to rename the package to `fakeroot`.
-
-```toml
-[dependencies]
-# Recommended rename for a cleaner API
-fakeroot = { package = "fakeroot-rs", version = "0.1.0" }
+```
+syscall ──> [seccomp filter]
+              ├─ read/write/mmap/...      → ALLOW (full speed; tracer never wakes)
+              └─ chown/stat/statx/...     → TRACE → ptrace supervisor
+                                                     ├─ records fake ownership
+                                                     └─ patches results / return values
 ```
 
-You can then use the `FakerootCommandExt` trait to apply the fakeroot environment to any `std::process::Command`.
+A small seccomp-BPF filter traps only the ~40 ownership-related syscalls and lets
+everything else run at native speed. The supervisor keeps an **in-memory**
+`(dev, ino) → ownership` table (nothing is persisted) and, by default, reports any
+untracked file as root-owned — matching fakeroot's "unknown is root" behavior, so
+files created during a build are packaged as `root:root` without explicit chowns.
+It handles `stat`/`statx`, `AT_EMPTY_PATH`/`AT_SYMLINK_NOFOLLOW`, device nodes
+(`mknod`), extended attributes including `security.capability`, and drops table
+entries when an inode's last link goes away so reused inodes start clean.
 
-### Example
-
-Here is a simple example of how to run `whoami` inside a fakeroot environment.
+## Library
 
 ```rust
 use std::process::Command;
-use anyhow::Result;
 use fakeroot::FakerootCommandExt;
 
-fn main() -> Result<()> {
-    println!("Running 'whoami' normally:");
-    Command::new("whoami").status()?;
-
-    println!("
-Running 'whoami' in a fakeroot environment:");
-    let mut cmd = Command::new("whoami");
-    let status = cmd.fakeroot()?.status()?; // Apply fakeroot
-
-    if !status.success() {
-        eprintln!("Fakeroot command failed!");
-    }
-
-    Ok(())
-}
+// Build a tarball whose contents are owned by root, as an unprivileged user:
+let status = Command::new("tar")
+    .args(["--numeric-owner", "-cf", "out.tar", "tree/"])
+    .fakeroot_status()?;
+assert!(status.success());
+# Ok::<(), fakeroot::Error>(())
 ```
 
-## CLI Usage
+`FakerootCommandExt` adds to `std::process::Command`:
 
-The `fakeroot-rs` binary can also be installed and used directly from the command line.
+- `fakeroot_status()` / `fakeroot_status_with(Options)` — run to completion, return
+  the exit status (blocks on the calling thread).
+- `fakeroot_spawn()` — run on a dedicated supervisor thread, returning a
+  `FakerootChild` you `wait()` on.
 
-### Installation
+## CLI
+
 ```sh
-cargo install fakeroot-rs
+fakeroot-rs <program> [args...]      # run a command in a fake-root environment
+RUST_LOG=debug fakeroot-rs ...       # trace intercepted syscalls
 ```
 
-### Examples
-```sh
-# Run a command in the fakeroot environment
-$ fakeroot-rs whoami
-root
+This is intentionally minimal. A full `fakeroot`-compatible CLI (login shell,
+`-s`/`-i`/`-u`/`-b`, environment compatibility) is a separate effort.
 
-# Start a new shell with root privileges
-$ fakeroot-rs
-# whoami
-root
-# exit
-```
+## Supported platforms
 
-## How It Works
+- **Linux only.** Requires unprivileged ptrace of own children (default in most
+  environments, including default-seccomp Docker).
+- **Architectures:** `x86_64` (amd64) and `aarch64` (arm64).
 
-This tool uses the `CLONE_NEWUSER` flag to create a new user namespace. Inside this namespace, it maps the container's root user (UID 0) to your real user ID on the host. This means that processes running inside the namespace think they are root, but any interaction with the host system is performed with your actual user privileges.
+## Limitations
+
+- No state save/load across runs (`fakeroot -s`/`-i`); the table lives only for the
+  duration of one run.
+- `Command::env_clear` isn't reflected (it isn't observable through the std API).
 
 ## License
 
-This project is licensed under the MIT License.
+MIT
