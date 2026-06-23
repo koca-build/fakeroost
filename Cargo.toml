@@ -1,13 +1,26 @@
 [package]
-name = "fakeroot-rs"
+name = "fakeroost"
 version = "0.1.0"
 edition = "2024"
-description = "A Rust-native fakeroot implementation using Linux user namespaces"
 license = "MIT"
-repository = "https://github.com/koca-build/fakeroot-rs"
+description = "A fakeroot implementation using ptrace + seccomp. Works under Docker's default seccomp profile and fakes ownership for static binaries."
+repository = "https://github.com/koca-build/fakeroost"
 readme = "README.md"
 
+[lib]
+name = "fakeroost"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fakeroost"
+path = "src/main.rs"
+
 [dependencies]
-anyhow = "1.0.102"
-libc = "0.2.183"
-nix = { version = "0.31.2", features = ["user", "process", "sched"] }
+libc = "0.2.186"
+nix = { version = "0.31.3", features = ["fs", "ptrace", "signal", "uio"] }
+seccompiler = "0.5.0"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+tempfile = "3.27.0"

@@ -1,75 +1,83 @@
-# `fakeroot-rs`
+# fakeroost
 
-[![Crates.io](https://img.shields.io/crates/v/fakeroot-rs.svg)](https://crates.io/crates/fakeroot-rs)
+`fakeroost` runs a command in a `fakeroot`-like environment: the program believes it is
+root and sees whatever file ownership it sets (via `chown`, `mknod`, …), while
+nothing on disk actually changes.
 
-A Rust-native implementation of `fakeroot`, using Linux user namespaces to run commands in an environment where it appears to have root privileges.
+Two things set it apart from the classic
+[`fakeroot`](https://wiki.debian.org/FakeRoot):
 
-This crate provides both a library for programmatic use in your own Rust projects and a standalone CLI binary.
+- **Works with static binaries (musl, Go, static Rust).** Classic fakeroot is an
+  `LD_PRELOAD` shim, invisible to statically-linked programs and to anything issuing
+  raw syscalls. fakeroost intercepts at the syscall boundary, so linking doesn't
+  matter.
+- **Works in Docker / CI with no extra privileges.** It runs under Docker's default
+  seccomp profile, where a user-namespace approach would be blocked.
 
-## Library Usage
+## Library
 
-To use this library, add it to your `Cargo.toml`. For a cleaner API, it's recommended to rename the package to `fakeroot`.
-
-```toml
-[dependencies]
-# Recommended rename for a cleaner API
-fakeroot = { package = "fakeroot-rs", version = "0.1.0" }
-```
-
-You can then use the `FakerootCommandExt` trait to apply the fakeroot environment to any `std::process::Command`.
-
-### Example
-
-Here is a simple example of how to run `whoami` inside a fakeroot environment.
-
-```rust
+```rust no_run
 use std::process::Command;
-use anyhow::Result;
-use fakeroot::FakerootCommandExt;
+use fakeroost::FakerootCommandExt;
 
-fn main() -> Result<()> {
-    println!("Running 'whoami' normally:");
-    Command::new("whoami").status()?;
+fn main() -> std::io::Result<()> {
+    // Call once, first thing in main(). See note below.
+    fakeroost::init();
 
-    println!("
-Running 'whoami' in a fakeroot environment:");
-    let mut cmd = Command::new("whoami");
-    let status = cmd.fakeroot()?.status()?; // Apply fakeroot
-
-    if !status.success() {
-        eprintln!("Fakeroot command failed!");
-    }
-
+    // Inside fakeroot the process believes it is root:
+    let out = Command::new("whoami").fakeroot().output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "root");
     Ok(())
 }
 ```
 
-## CLI Usage
+`FakerootCommandExt::fakeroot()` returns a plain `std::process::Command` that runs
+the same program under fakeroot — so stdio, pipes, `status()`/`output()`/`spawn()`
+and `Child` all work exactly as with any `Command`, and it drops into any API that
+already accepts a `Command`:
 
-The `fakeroot-rs` binary can also be installed and used directly from the command line.
-
-### Installation
-```sh
-cargo install fakeroot-rs
+```rust ignore
+let mut child = Command::new("make")
+    .arg("install")
+    .fakeroot()
+    .stdout(Stdio::piped())
+    .spawn()?;            // real Child: stream stdout, kill(), wait(), …
 ```
 
-### Examples
-```sh
-# Run a command in the fakeroot environment
-$ fakeroot-rs whoami
-root
+### Why `init()`?
 
-# Start a new shell with root privileges
-$ fakeroot-rs
-# whoami
-root
-# exit
+ptrace needs the tracer to be a separate process, so a `.fakeroot()` command runs
+your target by **re-executing your own program** in a supervisor mode rather than
+shipping a second binary. `fakeroost::init()` is the one line that detects that mode:
+it's a no-op on a normal launch, but on a fakeroot re-exec it runs the supervisor and
+exits without returning. Keep it at the very top of `main()`. Full details:
+[`fakeroost::init` on docs.rs](https://docs.rs/fakeroost).
+
+## CLI
+
+```sh
+fakeroost <program> [args...]      # run a command in a `fakeroot`-like environment
 ```
 
-## How It Works
+This is intentionally minimal. A full `fakeroot`-compatible CLI (login shell,
+`-s`/`-i`/`-u`/`-b`, environment compatibility) is a separate effort.
 
-This tool uses the `CLONE_NEWUSER` flag to create a new user namespace. Inside this namespace, it maps the container's root user (UID 0) to your real user ID on the host. This means that processes running inside the namespace think they are root, but any interaction with the host system is performed with your actual user privileges.
+## Supported platforms
+
+- **Linux only.** Requires unprivileged ptrace of own children (default in most
+  environments, including default-seccomp Docker).
+- **Architectures:** `x86_64` (amd64) and `aarch64` (arm64).
+
+## Limitations
+
+- No state save/load across runs (`fakeroot -s`/`-i`); the table lives only for the
+  duration of one run.
+- `Command::env_clear()` is unsupported — `.fakeroot()` can't tell whether you called
+  it, because the
+  [`Command::get_env_clear`](https://doc.rust-lang.org/std/process/struct.Command.html#method.get_env_clear)
+  getter is still unstable. Avoid calling it on a `.fakeroot()` command; we can support
+  it once that method stabilizes. (`env()` and `env_remove()` work fine.)
 
 ## License
 
-This project is licensed under the MIT License.
+MIT
