@@ -19,7 +19,7 @@ mod imp;
 mod imp;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-compile_error!("fakeroot-rs supports only x86_64 (amd64) and aarch64 (arm64)");
+compile_error!("fakeroost supports only x86_64 (amd64) and aarch64 (arm64)");
 
 pub use imp::Regs;
 

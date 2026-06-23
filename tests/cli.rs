@@ -1,4 +1,4 @@
-//! End-to-end tests driving the real `fakeroot-rs` binary against system tools
+//! End-to-end tests driving the real `fakeroost` binary against system tools
 //! (bash/coreutils/tar). These run the CLI as a separate process, so the
 //! fork+ptrace supervisor runs unencumbered by the test harness's threads.
 //!
@@ -8,9 +8,9 @@ use assert_cmd::Command;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// Run `bash -c <script>` under fakeroot-rs in `dir`; assert success; return stdout.
+/// Run `bash -c <script>` under fakeroost in `dir`; assert success; return stdout.
 fn fakeroot_sh(dir: &Path, script: &str) -> String {
-    let out = Command::cargo_bin("fakeroot-rs")
+    let out = Command::cargo_bin("fakeroost")
         .unwrap()
         .arg("bash")
         .arg("-c")
@@ -20,7 +20,7 @@ fn fakeroot_sh(dir: &Path, script: &str) -> String {
         .unwrap();
     assert!(
         out.status.success(),
-        "fakeroot-rs failed: status={:?}\nstderr:\n{}",
+        "fakeroost failed: status={:?}\nstderr:\n{}",
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );

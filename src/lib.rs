@@ -1,37 +1,4 @@
-//! # fakeroot-rs
-//!
-//! A [`fakeroot`](https://wiki.debian.org/fakeroot)-style fake-root environment for
-//! Linux, built on **ptrace** narrowed by a self-installed **seccomp `RET_TRACE`**
-//! filter. A program run under it believes it is root and sees whatever file
-//! ownership it sets, while nothing on disk is ever actually changed.
-//!
-//! Unlike the classic `LD_PRELOAD` fakeroot it works for **statically linked**
-//! binaries (Go, musl, static Rust); unlike the user-namespace approach it works
-//! under **Docker's default seccomp profile** with no extra privileges.
-//!
-//! ## Usage
-//!
-//! Call [`init`] once at the top of `main` (see its docs for the why), then use
-//! [`FakerootCommandExt::fakeroot`] to run any [`Command`] under fakeroot:
-//!
-//! ```no_run
-//! use std::process::Command;
-//! use fakeroot::FakerootCommandExt;
-//!
-//! fn main() -> std::io::Result<()> {
-//!     fakeroot::init();
-//!
-//!     // Inside fakeroot the process believes it is root:
-//!     let out = Command::new("whoami").fakeroot().output()?;
-//!     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "root");
-//!     Ok(())
-//! }
-//! ```
-//!
-//! [`fakeroot`](FakerootCommandExt::fakeroot) returns a plain
-//! [`std::process::Command`], so it drops into any API that accepts one and stdio,
-//! pipes, `output()`/`spawn()`, and [`std::process::Child`] all work as usual.
-
+#![doc = include_str!("../README.md")]
 // Many `as u64`/`as u32` casts on libc struct fields are redundant on x86_64 but
 // required on aarch64 (e.g. `nlink_t` is u32 there). Keep them for portability.
 #![allow(clippy::unnecessary_cast)]
@@ -59,9 +26,9 @@ mod sealed {
 /// Environment variable marking a process that was re-executed to act as the
 /// fakeroot supervisor. Set by [`FakerootCommandExt::fakeroot`], consumed by
 /// [`init`]. Internal — don't set or rely on it yourself.
-const SUPERVISE_VAR: &str = "__FAKEROOT_RS_SUPERVISE";
+const SUPERVISE_VAR: &str = "__FAKEROOST_SUPERVISE";
 
-/// Adds fake-root execution to [`std::process::Command`].
+/// Adds `fakeroot`-like execution to [`std::process::Command`].
 pub trait FakerootCommandExt: sealed::Sealed {
     /// Rewrite this command so that running it executes the same program under
     /// fakeroot, returning it as a plain [`std::process::Command`].
@@ -69,7 +36,8 @@ pub trait FakerootCommandExt: sealed::Sealed {
     /// The returned command re-executes the current program (see [`init`]) with
     /// the original program, arguments, environment overrides and working directory
     /// preserved. Run it however you like — `status()`, `output()`, `spawn()`, with
-    /// any stdio configuration — it behaves like a normal `Command`, just fake-rooted.
+    /// any stdio configuration — it behaves like a normal `Command`, just run under
+    /// fakeroot.
     ///
     /// Configure stdio (`.stdout`, pipes, …) on the **returned** command, not before:
     /// `Command` exposes no way to read back its stdio, so any redirection set prior
@@ -111,8 +79,8 @@ impl FakerootCommandExt for Command {
 ///
 /// Re-executing your own binary (rather than a separate helper) means there is
 /// nothing extra to ship or locate at runtime. The price is this one line: if it is
-/// missing, or runs after other startup logic, a fake-rooted command re-runs that
-/// logic instead of the intended target.
+/// missing, or runs after other startup logic, a [`fakeroot()`](FakerootCommandExt::fakeroot)
+/// command re-runs that logic instead of the intended target.
 pub fn init() {
     if std::env::var_os(SUPERVISE_VAR).is_none() {
         return;
@@ -123,7 +91,7 @@ pub fn init() {
     let code = match supervise(&args) {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
-            eprintln!("fakeroot: {e}");
+            eprintln!("fakeroost: {e}");
             1
         }
     };

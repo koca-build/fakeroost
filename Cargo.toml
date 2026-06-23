@@ -1,18 +1,18 @@
 [package]
-name = "fakeroot-rs"
+name = "fakeroost"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "A fakeroot implementation using ptrace + seccomp. Works under Docker's default seccomp profile and fakes ownership for static binaries."
-repository = "https://github.com/koca-build/fakeroot-rs"
+repository = "https://github.com/koca-build/fakeroost"
 readme = "README.md"
 
 [lib]
-name = "fakeroot"
+name = "fakeroost"
 path = "src/lib.rs"
 
 [[bin]]
-name = "fakeroot-rs"
+name = "fakeroost"
 path = "src/main.rs"
 
 [dependencies]

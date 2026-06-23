@@ -1,49 +1,28 @@
-# fakeroot-rs
+# fakeroost
 
-A [`fakeroot`](https://wiki.debian.org/fakeroot)-style fake-root environment for
-Linux, built on **ptrace** narrowed by a self-installed **seccomp `RET_TRACE`**
-filter. It lets an unprivileged process believe it is root and see whatever file
-ownership it sets — without ever changing anything on disk.
+`fakeroost` runs a command in a `fakeroot`-like environment: the program believes it is
+root and sees whatever file ownership it sets (via `chown`, `mknod`, …), while
+nothing on disk actually changes.
 
-It exists to fix two things the classic fakeroot can't do in modern setups:
+Two things set it apart from the classic
+[`fakeroot`](https://wiki.debian.org/FakeRoot):
 
-- **Static binaries.** Classic fakeroot is an `LD_PRELOAD` shim, so it's invisible
-  to statically-linked programs (Go, musl, static Rust) and to anything that issues
-  raw syscalls. fakeroot-rs intercepts at the **syscall boundary**, so linking
-  doesn't matter.
-- **Locked-down Docker / CI.** It needs **no extra privileges** and works under
-  Docker's **default seccomp profile**: installing a seccomp filter via `prctl` and
-  ptracing your own children are both permitted there, whereas the user-namespace
-  approach (`clone(CLONE_NEWUSER)`) is blocked.
-
-## How it works
-
-```
-syscall ──> [seccomp filter]
-              ├─ read/write/mmap/...      → ALLOW (full speed; tracer never wakes)
-              └─ chown/stat/statx/...     → TRACE → ptrace supervisor
-                                                     ├─ records fake ownership
-                                                     └─ patches results / return values
-```
-
-A small seccomp-BPF filter traps only the ~40 ownership-related syscalls and lets
-everything else run at native speed. The supervisor keeps an **in-memory**
-`(dev, ino) → ownership` table (nothing is persisted) and, by default, reports any
-untracked file as root-owned — matching fakeroot's "unknown is root" behavior, so
-files created during a build are packaged as `root:root` without explicit chowns.
-It handles `stat`/`statx`, `AT_EMPTY_PATH`/`AT_SYMLINK_NOFOLLOW`, device nodes
-(`mknod`), extended attributes including `security.capability`, and drops table
-entries when an inode's last link goes away so reused inodes start clean.
+- **Works with static binaries (musl, Go, static Rust).** Classic fakeroot is an
+  `LD_PRELOAD` shim, invisible to statically-linked programs and to anything issuing
+  raw syscalls. fakeroost intercepts at the syscall boundary, so linking doesn't
+  matter.
+- **Works in Docker / CI with no extra privileges.** It runs under Docker's default
+  seccomp profile, where a user-namespace approach would be blocked.
 
 ## Library
 
-```rust
+```rust no_run
 use std::process::Command;
-use fakeroot::FakerootCommandExt;
+use fakeroost::FakerootCommandExt;
 
 fn main() -> std::io::Result<()> {
     // Call once, first thing in main(). See note below.
-    fakeroot::init();
+    fakeroost::init();
 
     // Inside fakeroot the process believes it is root:
     let out = Command::new("whoami").fakeroot().output()?;
@@ -57,7 +36,7 @@ the same program under fakeroot — so stdio, pipes, `status()`/`output()`/`spaw
 and `Child` all work exactly as with any `Command`, and it drops into any API that
 already accepts a `Command`:
 
-```rust
+```rust ignore
 let mut child = Command::new("make")
     .arg("install")
     .fakeroot()
@@ -69,15 +48,15 @@ let mut child = Command::new("make")
 
 ptrace needs the tracer to be a separate process, so a `.fakeroot()` command runs
 your target by **re-executing your own program** in a supervisor mode rather than
-shipping a second binary. `fakeroot::init()` is the one line that detects that mode:
+shipping a second binary. `fakeroost::init()` is the one line that detects that mode:
 it's a no-op on a normal launch, but on a fakeroot re-exec it runs the supervisor and
 exits without returning. Keep it at the very top of `main()`. Full details:
-[`fakeroot::init` on docs.rs](https://docs.rs/fakeroot-rs).
+[`fakeroost::init` on docs.rs](https://docs.rs/fakeroost).
 
 ## CLI
 
 ```sh
-fakeroot-rs <program> [args...]      # run a command in a fake-root environment
+fakeroost <program> [args...]      # run a command in a `fakeroot`-like environment
 ```
 
 This is intentionally minimal. A full `fakeroot`-compatible CLI (login shell,
