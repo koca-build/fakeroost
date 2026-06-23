@@ -1,0 +1,6 @@
+[env]
+# Expose `libc::statx` and the `STATX_*` constants on musl targets. The `libc`
+# crate gates them behind `musl_v1_2_3` because `struct statx` only exists in
+# musl >= 1.2.3, and the only way to enable that cfg is this env var. The musl
+# we build against (zig's bundled musl) is well past 1.2.3. No effect on glibc.
+RUST_LIBC_UNSTABLE_MUSL_V1_2_3 = "1"
