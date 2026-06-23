@@ -72,7 +72,11 @@ This is intentionally minimal. A full `fakeroot`-compatible CLI (login shell,
 
 - No state save/load across runs (`fakeroot -s`/`-i`); the table lives only for the
   duration of one run.
-- `Command::env_clear` isn't reflected (it isn't observable through the std API).
+- `Command::env_clear()` is unsupported — `.fakeroot()` can't tell whether you called
+  it, because the
+  [`Command::get_env_clear`](https://doc.rust-lang.org/std/process/struct.Command.html#method.get_env_clear)
+  getter is still unstable. Avoid calling it on a `.fakeroot()` command; we can support
+  it once that method stabilizes. (`env()` and `env_remove()` work fine.)
 
 ## License
 
