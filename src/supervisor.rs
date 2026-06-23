@@ -7,9 +7,6 @@
 //! 2. We inspect/modify args; if we need the result we `PTRACE_SYSCALL` to the
 //!    syscall-exit stop and patch there; otherwise we `PTRACE_CONT` and the
 //!    syscall runs normally.
-//!
-//! In M1 every handler is a no-op pass-through (the syscall just runs); the real
-//! handlers land in M2+.
 
 use crate::arch::{RegAccess, Regs};
 use crate::error::Result;
@@ -138,7 +135,7 @@ impl Supervisor {
 
         // If the tree drained without an explicit code (shouldn't normally happen),
         // assume success.
-        Ok(self.root_status.unwrap_or_else(|| ExitStatus::from_raw(0)))
+        Ok(self.root_status.unwrap_or(ExitStatus::from_raw(0)))
     }
 
     fn on_event(&mut self, pid: Pid, event: i32) -> Result<()> {

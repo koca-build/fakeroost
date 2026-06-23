@@ -60,21 +60,23 @@ pub fn read_struct<T: Copy>(pid: Pid, addr: u64) -> Result<T> {
 pub fn read_cstring(pid: Pid, mut addr: u64) -> Result<Vec<u8>> {
     const PAGE: u64 = 4096;
     const MAX: usize = 4096; // PATH_MAX
+    let mut buf = [0u8; 256];
     let mut out = Vec::new();
     loop {
-        let to_page_end = (PAGE - (addr % PAGE)) as usize;
-        let chunk = to_page_end.min(256);
-        let mut buf = vec![0u8; chunk];
-        read(pid, addr, &mut buf)?;
-        if let Some(pos) = buf.iter().position(|&b| b == 0) {
-            out.extend_from_slice(&buf[..pos]);
+        let len = ((PAGE - (addr % PAGE)) as usize).min(buf.len());
+        let chunk = &mut buf[..len];
+        read(pid, addr, chunk)?;
+        if let Some(pos) = chunk.iter().position(|&b| b == 0) {
+            out.extend_from_slice(&chunk[..pos]);
             return Ok(out);
         }
-        out.extend_from_slice(&buf);
+        out.extend_from_slice(chunk);
         if out.len() > MAX {
             return Err(Error::Other("path from tracee exceeds PATH_MAX".into()));
         }
-        addr += chunk as u64;
+        // saturating: a garbage tracee pointer near u64::MAX must never panic us
+        // (the next `read` will EFAULT and return cleanly instead).
+        addr = addr.saturating_add(chunk.len() as u64);
     }
 }
 

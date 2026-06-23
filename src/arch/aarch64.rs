@@ -7,9 +7,6 @@
 //! Gotcha: on aarch64 the syscall number CANNOT be changed by writing `x8` in the
 //! `NT_PRSTATUS` set after entry — it must be set via the `NT_ARM_SYSTEM_CALL`
 //! regset. We stash the override and apply it in `store`.
-//!
-//! NOTE: this target is built/tested via qemu-binfmt in M6; if the `nix` regset
-//! API differs, adjust here — the rest of the crate is arch-independent.
 
 use super::RegAccess;
 use crate::error::Result;

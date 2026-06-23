@@ -22,9 +22,9 @@ pub struct FakeNode {
     pub mode: Option<u32>,
     /// Device id to report for device nodes. Set by `mknod`.
     pub rdev: Option<u64>,
-    /// Overridden hard-link count. Set by `link`/`unlink` tracking (M5).
+    /// Overridden hard-link count, when faked.
     pub nlink: Option<u64>,
-    /// Faked extended attributes (e.g. `security.capability`). (M4)
+    /// Faked extended attributes (e.g. `security.capability`).
     pub xattrs: HashMap<CString, Vec<u8>>,
 }
 

@@ -56,57 +56,153 @@ pub enum ExitAction {
     },
 }
 
+/// The handler family a trapped syscall routes to.
+///
+/// [`REGISTRY`] maps every intercepted syscall to one of these, and *both* the
+/// seccomp trap set ([`trapped_syscalls`]) and the entry dispatcher
+/// ([`handle_entry`]) are derived from that one table. That makes drift impossible:
+/// a syscall can't be trapped without a handler (the tuple demands a `Family`) nor
+/// handled without being trapped (the `match` is exhaustive over `Family`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family {
+    /// stat/lstat/fstat/newfstatat/statx — overlay ownership onto the result buffer
+    /// at the given arg index.
+    Stat(StatKind, usize),
+    /// getuid/geteuid/getgid/getegid plus every credential *setter* — faked to 0.
+    Cred,
+    /// getresuid/getresgid — write fake ids into the (up to three) out-params.
+    CredRes,
+    /// chown/lchown/fchown/fchownat — record the fake owner, skip the real call.
+    Chown,
+    /// chmod/fchmod/fchmodat — record the fake mode, let the real call run.
+    Chmod,
+    /// mknod/mknodat — drop a placeholder file, record the intended device node.
+    Mknod,
+    /// The 12 `*xattr` syscalls — fake xattrs (`security.capability`, ACLs) in the table.
+    Xattr,
+    /// unlink/rmdir/unlinkat — drop the table entry once the inode's last link is gone.
+    Unlink,
+    /// rename/renameat/renameat2 — clean up a clobbered destination inode.
+    Rename,
+}
+
+/// The single source of truth for which syscalls we intercept and how.
+///
+/// The bare, non-`*at` syscalls (`stat`, `chown`, `chmod`, `rename`, …) are the
+/// original kernel interfaces; the `*at` family and `statx` came later. aarch64 was
+/// added to Linux after that, so its syscall table only has the `*at` forms — the
+/// bare numbers don't exist there. That (and only that) is why those rows are
+/// `#[cfg]`-gated to x86_64; it's the one place this arch knowledge lives.
+#[rustfmt::skip]
+const REGISTRY: &[(i64, Family)] = &[
+    // stat family (kept first — by far the most frequently trapped)
+    #[cfg(target_arch = "x86_64")] (libc::SYS_stat,  Family::Stat(StatKind::Native, 1)),
+    #[cfg(target_arch = "x86_64")] (libc::SYS_lstat, Family::Stat(StatKind::Native, 1)),
+    (libc::SYS_fstat,      Family::Stat(StatKind::Native, 1)),
+    (libc::SYS_newfstatat, Family::Stat(StatKind::Native, 2)),
+    (libc::SYS_statx,      Family::Stat(StatKind::Statx, 4)),
+    // chown family
+    #[cfg(target_arch = "x86_64")] (libc::SYS_chown,  Family::Chown),
+    #[cfg(target_arch = "x86_64")] (libc::SYS_lchown, Family::Chown),
+    (libc::SYS_fchown,   Family::Chown),
+    (libc::SYS_fchownat, Family::Chown),
+    // chmod family
+    #[cfg(target_arch = "x86_64")] (libc::SYS_chmod, Family::Chmod),
+    (libc::SYS_fchmod,   Family::Chmod),
+    (libc::SYS_fchmodat, Family::Chmod),
+    // mknod
+    #[cfg(target_arch = "x86_64")] (libc::SYS_mknod, Family::Mknod),
+    (libc::SYS_mknodat, Family::Mknod),
+    // credentials (read) — faked to root
+    (libc::SYS_getuid,    Family::Cred),
+    (libc::SYS_geteuid,   Family::Cred),
+    (libc::SYS_getgid,    Family::Cred),
+    (libc::SYS_getegid,   Family::Cred),
+    (libc::SYS_getresuid, Family::CredRes),
+    (libc::SYS_getresgid, Family::CredRes),
+    // credentials (set) — faked to succeed
+    (libc::SYS_setuid,    Family::Cred),
+    (libc::SYS_setgid,    Family::Cred),
+    (libc::SYS_setreuid,  Family::Cred),
+    (libc::SYS_setregid,  Family::Cred),
+    (libc::SYS_setresuid, Family::Cred),
+    (libc::SYS_setresgid, Family::Cred),
+    (libc::SYS_setfsuid,  Family::Cred),
+    (libc::SYS_setfsgid,  Family::Cred),
+    (libc::SYS_setgroups, Family::Cred),
+    (libc::SYS_capset,    Family::Cred),
+    // inode lifecycle
+    #[cfg(target_arch = "x86_64")] (libc::SYS_unlink, Family::Unlink),
+    (libc::SYS_unlinkat, Family::Unlink),
+    #[cfg(target_arch = "x86_64")] (libc::SYS_rmdir,    Family::Unlink),
+    #[cfg(target_arch = "x86_64")] (libc::SYS_rename,   Family::Rename),
+    #[cfg(target_arch = "x86_64")] (libc::SYS_renameat, Family::Rename),
+    (libc::SYS_renameat2, Family::Rename),
+    // xattr
+    (libc::SYS_setxattr,     Family::Xattr),
+    (libc::SYS_lsetxattr,    Family::Xattr),
+    (libc::SYS_fsetxattr,    Family::Xattr),
+    (libc::SYS_getxattr,     Family::Xattr),
+    (libc::SYS_lgetxattr,    Family::Xattr),
+    (libc::SYS_fgetxattr,    Family::Xattr),
+    (libc::SYS_listxattr,    Family::Xattr),
+    (libc::SYS_llistxattr,   Family::Xattr),
+    (libc::SYS_flistxattr,   Family::Xattr),
+    (libc::SYS_removexattr,  Family::Xattr),
+    (libc::SYS_lremovexattr, Family::Xattr),
+    (libc::SYS_fremovexattr, Family::Xattr),
+];
+
+/// The syscalls to trap with seccomp `RET_TRACE`, derived from [`REGISTRY`].
+pub(crate) fn trapped_syscalls() -> Vec<i64> {
+    REGISTRY.iter().map(|&(nr, _)| nr).collect()
+}
+
+/// Map a syscall number to its handler family. A linear scan of [`REGISTRY`] —
+/// tiny, and dwarfed by the ptrace stop that delivered us here.
+fn classify(nr: i64) -> Option<Family> {
+    REGISTRY.iter().find(|&&(n, _)| n == nr).map(|&(_, f)| f)
+}
+
 /// Inspect a trapped syscall at its entry (seccomp) stop and decide what to do.
 /// May record fake ownership in `table`.
 pub fn handle_entry(pid: Pid, table: &mut OwnershipTable, regs: &Regs) -> Result<Disposition> {
     let nr = regs.syscall_no();
-
-    if let Some((kind, buf_arg)) = classify_stat(nr) {
-        return Ok(Disposition::Step(ExitAction::PatchStat {
+    let Some(family) = classify(nr) else {
+        return Ok(Disposition::Passthrough);
+    };
+    match family {
+        Family::Stat(kind, buf_arg) => Ok(Disposition::Step(ExitAction::PatchStat {
             kind,
             buf: regs.arg(buf_arg),
-        }));
+        })),
+        Family::Cred => Ok(Disposition::Skip(ExitAction::ForceRet(0))),
+        Family::CredRes => Ok(Disposition::Skip(ExitAction::WriteResId {
+            ptrs: [regs.arg(0), regs.arg(1), regs.arg(2)],
+        })),
+        Family::Chown => handle_chown(pid, table, nr, regs),
+        Family::Chmod => handle_chmod(pid, table, nr, regs),
+        Family::Mknod => handle_mknod(pid, table, nr, regs),
+        Family::Xattr => handle_xattr(pid, table, nr, regs),
+        Family::Unlink => handle_unlink(pid, nr, regs),
+        Family::Rename => handle_rename(pid, nr, regs),
     }
-    if let Some(d) = handle_creds(nr, regs) {
-        return Ok(d);
-    }
-    if let Some(d) = handle_chown(pid, table, nr, regs)? {
-        return Ok(d);
-    }
-    if let Some(d) = handle_chmod(pid, table, nr, regs)? {
-        return Ok(d);
-    }
-    if let Some(d) = handle_mknod(pid, table, nr, regs)? {
-        return Ok(d);
-    }
-    if let Some(d) = handle_xattr(pid, table, nr, regs)? {
-        return Ok(d);
-    }
-    if let Some(d) = handle_unlink(pid, nr, regs)? {
-        return Ok(d);
-    }
-    if let Some(d) = handle_rename(pid, nr, regs)? {
-        return Ok(d);
-    }
-    Ok(Disposition::Passthrough)
 }
 
 /// unlink/rmdir/unlinkat — let the real removal happen, then (at exit) drop the
 /// table entry if the inode's last link is gone.
-fn handle_unlink(pid: Pid, nr: i64, regs: &Regs) -> Result<Option<Disposition>> {
+fn handle_unlink(pid: Pid, nr: i64, regs: &Regs) -> Result<Disposition> {
     #[cfg(target_arch = "x86_64")]
-    {
-        if nr == libc::SYS_unlink || nr == libc::SYS_rmdir {
-            let p = read_path(pid, regs.arg(0))?;
-            return Ok(Some(unlink_commit(pid, AT_FDCWD, &p)));
-        }
+    if nr == libc::SYS_unlink || nr == libc::SYS_rmdir {
+        let p = read_path(pid, regs.arg(0))?;
+        return Ok(unlink_commit(pid, AT_FDCWD, &p));
     }
     if nr == libc::SYS_unlinkat {
         let dirfd = regs.arg(0) as i32;
         let p = read_path(pid, regs.arg(1))?;
-        return Ok(Some(unlink_commit(pid, dirfd, &p)));
+        return Ok(unlink_commit(pid, dirfd, &p));
     }
-    Ok(None)
+    Ok(Disposition::Passthrough)
 }
 
 fn unlink_commit(pid: Pid, dirfd: i32, path: &Path) -> Disposition {
@@ -124,79 +220,33 @@ fn unlink_commit(pid: Pid, dirfd: i32, path: &Path) -> Disposition {
 
 /// rename/renameat/renameat2 — if the destination already exists it will be
 /// overwritten, so schedule a table cleanup for the clobbered inode.
-fn handle_rename(pid: Pid, nr: i64, regs: &Regs) -> Result<Option<Disposition>> {
-    let newdirfd;
-    let new_arg;
-    let flags;
+fn handle_rename(pid: Pid, nr: i64, regs: &Regs) -> Result<Disposition> {
+    let Some((newdirfd, new_arg, flags)) = rename_dest(nr, regs) else {
+        return Ok(Disposition::Passthrough);
+    };
+    // RENAME_EXCHANGE swaps both names; nothing is removed.
+    if flags & libc::RENAME_EXCHANGE as i32 != 0 {
+        return Ok(Disposition::Passthrough);
+    }
+    let newp = read_path(pid, regs.arg(new_arg))?;
+    Ok(unlink_commit(pid, newdirfd, &newp))
+}
 
+/// The `(dest dirfd, dest path arg index, flags)` of a rename-family syscall.
+fn rename_dest(nr: i64, regs: &Regs) -> Option<(i32, usize, i32)> {
     #[cfg(target_arch = "x86_64")]
     {
         if nr == libc::SYS_rename {
-            newdirfd = AT_FDCWD;
-            new_arg = 1usize;
-            flags = 0i32;
-        } else if nr == libc::SYS_renameat {
-            newdirfd = regs.arg(2) as i32;
-            new_arg = 3;
-            flags = 0;
-        } else if nr == libc::SYS_renameat2 {
-            newdirfd = regs.arg(2) as i32;
-            new_arg = 3;
-            flags = regs.arg(4) as i32;
-        } else {
-            return Ok(None);
+            return Some((AT_FDCWD, 1, 0));
+        }
+        if nr == libc::SYS_renameat {
+            return Some((regs.arg(2) as i32, 3, 0));
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        if nr == libc::SYS_renameat2 {
-            newdirfd = regs.arg(2) as i32;
-            new_arg = 3;
-            flags = regs.arg(4) as i32;
-        } else {
-            return Ok(None);
-        }
+    if nr == libc::SYS_renameat2 {
+        return Some((regs.arg(2) as i32, 3, regs.arg(4) as i32));
     }
-
-    // RENAME_EXCHANGE swaps both names; nothing is removed.
-    if flags & libc::RENAME_EXCHANGE as i32 != 0 {
-        return Ok(Some(Disposition::Passthrough));
-    }
-    let newp = read_path(pid, regs.arg(new_arg))?;
-    Ok(Some(unlink_commit(pid, newdirfd, &newp)))
-}
-
-/// Fake credential syscalls so the tracee believes it is root.
-fn handle_creds(nr: i64, regs: &Regs) -> Option<Disposition> {
-    // These all exist on both x86_64 and aarch64.
-    match nr {
-        n if n == libc::SYS_getuid
-            || n == libc::SYS_geteuid
-            || n == libc::SYS_getgid
-            || n == libc::SYS_getegid =>
-        {
-            Some(Disposition::Skip(ExitAction::ForceRet(0)))
-        }
-        n if n == libc::SYS_getresuid || n == libc::SYS_getresgid => {
-            Some(Disposition::Skip(ExitAction::WriteResId {
-                ptrs: [regs.arg(0), regs.arg(1), regs.arg(2)],
-            }))
-        }
-        n if n == libc::SYS_setuid
-            || n == libc::SYS_setgid
-            || n == libc::SYS_setreuid
-            || n == libc::SYS_setregid
-            || n == libc::SYS_setresuid
-            || n == libc::SYS_setresgid
-            || n == libc::SYS_setfsuid
-            || n == libc::SYS_setfsgid
-            || n == libc::SYS_setgroups
-            || n == libc::SYS_capset =>
-        {
-            Some(Disposition::Skip(ExitAction::ForceRet(0)))
-        }
-        _ => None,
-    }
+    None
 }
 
 fn read_path(pid: Pid, addr: u64) -> Result<PathBuf> {
@@ -219,89 +269,64 @@ fn record_chown(table: &mut OwnershipTable, rs: &path::RealStat, uid: u32, gid: 
 }
 
 /// chown/lchown/fchown/fchownat — record the fake owner, skip the real call.
-fn handle_chown(
-    pid: Pid,
-    table: &mut OwnershipTable,
-    nr: i64,
-    regs: &Regs,
-) -> Result<Option<Disposition>> {
-    let rs;
-    let (uid, gid);
+fn handle_chown(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
+    let Some((rs, uid, gid)) = chown_target(pid, nr, regs)? else {
+        return Ok(Disposition::Passthrough);
+    };
+    record_chown(table, &rs, uid, gid);
+    Ok(Disposition::Skip(ExitAction::ForceRet(0)))
+}
 
+/// Resolve a chown-family syscall to `(target inode, uid, gid)`.
+fn chown_target(pid: Pid, nr: i64, regs: &Regs) -> Result<Option<(path::RealStat, u32, u32)>> {
     #[cfg(target_arch = "x86_64")]
-    {
-        if nr == libc::SYS_chown || nr == libc::SYS_lchown {
-            let path = read_path(pid, regs.arg(0))?;
-            let nofollow = nr == libc::SYS_lchown;
-            rs = path::stat_target(pid, AT_FDCWD, &path, nofollow, false)?;
-            uid = regs.arg(1) as u32;
-            gid = regs.arg(2) as u32;
-            record_chown(table, &rs, uid, gid);
-            return Ok(Some(Disposition::Skip(ExitAction::ForceRet(0))));
-        }
+    if nr == libc::SYS_chown || nr == libc::SYS_lchown {
+        let path = read_path(pid, regs.arg(0))?;
+        let rs = path::stat_target(pid, AT_FDCWD, &path, nr == libc::SYS_lchown, false)?;
+        return Ok(Some((rs, regs.arg(1) as u32, regs.arg(2) as u32)));
     }
-
     if nr == libc::SYS_fchown {
-        let fd = regs.arg(0) as i32;
-        rs = path::stat_target(pid, fd, std::path::Path::new(""), false, true)?;
-        uid = regs.arg(1) as u32;
-        gid = regs.arg(2) as u32;
-        record_chown(table, &rs, uid, gid);
-        return Ok(Some(Disposition::Skip(ExitAction::ForceRet(0))));
+        let rs = path::stat_target(pid, regs.arg(0) as i32, Path::new(""), false, true)?;
+        return Ok(Some((rs, regs.arg(1) as u32, regs.arg(2) as u32)));
     }
     if nr == libc::SYS_fchownat {
-        let dirfd = regs.arg(0) as i32;
         let path = read_path(pid, regs.arg(1))?;
         let flags = regs.arg(4) as i32;
         let nofollow = flags & libc::AT_SYMLINK_NOFOLLOW != 0;
         let empty = flags & libc::AT_EMPTY_PATH != 0;
-        rs = path::stat_target(pid, dirfd, &path, nofollow, empty)?;
-        uid = regs.arg(2) as u32;
-        gid = regs.arg(3) as u32;
-        record_chown(table, &rs, uid, gid);
-        return Ok(Some(Disposition::Skip(ExitAction::ForceRet(0))));
+        let rs = path::stat_target(pid, regs.arg(0) as i32, &path, nofollow, empty)?;
+        return Ok(Some((rs, regs.arg(2) as u32, regs.arg(3) as u32)));
     }
     Ok(None)
 }
 
 /// chmod/fchmod/fchmodat — record the fake mode but let the real call run so the
 /// on-disk permission bits update when the user is allowed to set them.
-fn handle_chmod(
-    pid: Pid,
-    table: &mut OwnershipTable,
-    nr: i64,
-    regs: &Regs,
-) -> Result<Option<Disposition>> {
-    let rs;
-    let req_mode;
+fn handle_chmod(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
+    let Some((rs, req_mode)) = chmod_target(pid, nr, regs)? else {
+        return Ok(Disposition::Passthrough);
+    };
+    record_chmod(table, &rs, req_mode);
+    Ok(Disposition::Step(ExitAction::ZeroOnErr))
+}
 
+/// Resolve a chmod-family syscall to `(target inode, requested mode)`.
+fn chmod_target(pid: Pid, nr: i64, regs: &Regs) -> Result<Option<(path::RealStat, u32)>> {
     #[cfg(target_arch = "x86_64")]
-    {
-        if nr == libc::SYS_chmod {
-            let path = read_path(pid, regs.arg(0))?;
-            rs = path::stat_target(pid, AT_FDCWD, &path, false, false)?;
-            req_mode = regs.arg(1) as u32;
-            record_chmod(table, &rs, req_mode);
-            return Ok(Some(Disposition::Step(ExitAction::ZeroOnErr)));
-        }
+    if nr == libc::SYS_chmod {
+        let path = read_path(pid, regs.arg(0))?;
+        let rs = path::stat_target(pid, AT_FDCWD, &path, false, false)?;
+        return Ok(Some((rs, regs.arg(1) as u32)));
     }
-
     if nr == libc::SYS_fchmod {
-        let fd = regs.arg(0) as i32;
-        rs = path::stat_target(pid, fd, std::path::Path::new(""), false, true)?;
-        req_mode = regs.arg(1) as u32;
-        record_chmod(table, &rs, req_mode);
-        return Ok(Some(Disposition::Step(ExitAction::ZeroOnErr)));
+        let rs = path::stat_target(pid, regs.arg(0) as i32, Path::new(""), false, true)?;
+        return Ok(Some((rs, regs.arg(1) as u32)));
     }
     if nr == libc::SYS_fchmodat {
-        let dirfd = regs.arg(0) as i32;
         let path = read_path(pid, regs.arg(1))?;
-        let flags = regs.arg(3) as i32;
-        let nofollow = flags & libc::AT_SYMLINK_NOFOLLOW != 0;
-        rs = path::stat_target(pid, dirfd, &path, nofollow, false)?;
-        req_mode = regs.arg(2) as u32;
-        record_chmod(table, &rs, req_mode);
-        return Ok(Some(Disposition::Step(ExitAction::ZeroOnErr)));
+        let nofollow = regs.arg(3) as i32 & libc::AT_SYMLINK_NOFOLLOW != 0;
+        let rs = path::stat_target(pid, regs.arg(0) as i32, &path, nofollow, false)?;
+        return Ok(Some((rs, regs.arg(2) as u32)));
     }
     Ok(None)
 }
@@ -314,19 +339,12 @@ fn record_chmod(table: &mut OwnershipTable, rs: &path::RealStat, req_mode: u32) 
 /// mknod/mknodat — we can't create real device nodes unprivileged, so drop a
 /// regular placeholder file and record the intended type + rdev so `stat` reports
 /// a device node (and archivers store one).
-fn handle_mknod(
-    pid: Pid,
-    table: &mut OwnershipTable,
-    nr: i64,
-    regs: &Regs,
-) -> Result<Option<Disposition>> {
+fn handle_mknod(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
     #[cfg(target_arch = "x86_64")]
-    {
-        if nr == libc::SYS_mknod {
-            let p = read_path(pid, regs.arg(0))?;
-            let resolved = path::resolve_path(pid, AT_FDCWD, &p, false);
-            return finish_mknod(table, &resolved, regs.arg(1) as u32, regs.arg(2));
-        }
+    if nr == libc::SYS_mknod {
+        let p = read_path(pid, regs.arg(0))?;
+        let resolved = path::resolve_path(pid, AT_FDCWD, &p, false);
+        return finish_mknod(table, &resolved, regs.arg(1) as u32, regs.arg(2));
     }
     if nr == libc::SYS_mknodat {
         let dirfd = regs.arg(0) as i32;
@@ -334,7 +352,7 @@ fn handle_mknod(
         let resolved = path::resolve_path(pid, dirfd, &p, false);
         return finish_mknod(table, &resolved, regs.arg(2) as u32, regs.arg(3));
     }
-    Ok(None)
+    Ok(Disposition::Passthrough)
 }
 
 fn finish_mknod(
@@ -342,7 +360,7 @@ fn finish_mknod(
     resolved: &Path,
     mode: u32,
     dev: u64,
-) -> Result<Option<Disposition>> {
+) -> Result<Disposition> {
     use std::os::unix::fs::OpenOptionsExt;
     // Create the placeholder as a normal file (best-effort; ignore EEXIST).
     let _ = std::fs::OpenOptions::new()
@@ -361,7 +379,7 @@ fn finish_mknod(
     if kind == libc::S_IFCHR || kind == libc::S_IFBLK {
         node.rdev = Some(dev);
     }
-    Ok(Some(Disposition::Skip(ExitAction::ForceRet(0))))
+    Ok(Disposition::Skip(ExitAction::ForceRet(0)))
 }
 
 fn is_xattr_f_variant(nr: i64) -> bool {
@@ -390,12 +408,7 @@ fn xattr_target(pid: Pid, nr: i64, regs: &Regs) -> Result<path::RealStat> {
 
 /// Fake xattrs in the table. Crucial for `security.capability` and POSIX ACLs,
 /// which a non-root process can't really set but packagers need archived.
-fn handle_xattr(
-    pid: Pid,
-    table: &mut OwnershipTable,
-    nr: i64,
-    regs: &Regs,
-) -> Result<Option<Disposition>> {
+fn handle_xattr(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
     const MAX_XATTR: usize = 64 * 1024;
 
     // set*xattr(target, name, value, size, flags)
@@ -408,7 +421,7 @@ fn handle_xattr(
             mem::read(pid, regs.arg(2), &mut value)?;
         }
         table.entry(rs.dev, rs.ino).xattrs.insert(name, value);
-        return Ok(Some(Disposition::Skip(ExitAction::ForceRet(0))));
+        return Ok(Disposition::Skip(ExitAction::ForceRet(0)));
     }
 
     // get*xattr(target, name, value, size)
@@ -416,14 +429,14 @@ fn handle_xattr(
         let rs = xattr_target(pid, nr, regs)?;
         let name = CString::new(mem::read_cstring(pid, regs.arg(1))?).unwrap_or_default();
         if let Some(value) = table.get(rs.dev, rs.ino).and_then(|n| n.xattrs.get(&name)) {
-            return Ok(Some(Disposition::Skip(ExitAction::ReturnXattr {
+            return Ok(Disposition::Skip(ExitAction::ReturnXattr {
                 buf: regs.arg(2),
                 size: regs.arg(3),
                 value: value.clone(),
-            })));
+            }));
         }
         // Not faked — let the real xattr (e.g. user.*) through.
-        return Ok(Some(Disposition::Passthrough));
+        return Ok(Disposition::Passthrough);
     }
 
     // list*xattr(target, list, size)
@@ -434,13 +447,13 @@ fn handle_xattr(
             .map(|n| n.xattrs.keys().map(|k| k.as_bytes().to_vec()).collect())
             .unwrap_or_default();
         if extra.is_empty() {
-            return Ok(Some(Disposition::Passthrough));
+            return Ok(Disposition::Passthrough);
         }
-        return Ok(Some(Disposition::Step(ExitAction::MergeXattrList {
+        return Ok(Disposition::Step(ExitAction::MergeXattrList {
             buf: regs.arg(1),
             size: regs.arg(2),
             extra,
-        })));
+        }));
     }
 
     // remove*xattr(target, name)
@@ -448,10 +461,10 @@ fn handle_xattr(
         let rs = xattr_target(pid, nr, regs)?;
         let name = CString::new(mem::read_cstring(pid, regs.arg(1))?).unwrap_or_default();
         table.entry(rs.dev, rs.ino).xattrs.remove(&name);
-        return Ok(Some(Disposition::Skip(ExitAction::ForceRet(0))));
+        return Ok(Disposition::Skip(ExitAction::ForceRet(0)));
     }
 
-    Ok(None)
+    Ok(Disposition::Passthrough)
 }
 
 /// Apply an [`ExitAction`] at a syscall-exit stop.
@@ -556,62 +569,32 @@ pub enum StatKind {
     Statx,
 }
 
-/// If `nr` is a stat-family syscall, return `(kind, buffer_arg_index)`.
-#[cfg(target_arch = "x86_64")]
-pub fn classify_stat(nr: i64) -> Option<(StatKind, usize)> {
-    match nr {
-        n if n == libc::SYS_stat => Some((StatKind::Native, 1)),
-        n if n == libc::SYS_lstat => Some((StatKind::Native, 1)),
-        n if n == libc::SYS_fstat => Some((StatKind::Native, 1)),
-        n if n == libc::SYS_newfstatat => Some((StatKind::Native, 2)),
-        n if n == libc::SYS_statx => Some((StatKind::Statx, 4)),
-        _ => None,
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-pub fn classify_stat(nr: i64) -> Option<(StatKind, usize)> {
-    match nr {
-        n if n == libc::SYS_fstat => Some((StatKind::Native, 1)),
-        n if n == libc::SYS_newfstatat => Some((StatKind::Native, 2)),
-        n if n == libc::SYS_statx => Some((StatKind::Statx, 4)),
-        _ => None,
-    }
-}
-
 /// At a stat-family syscall-exit (return value already 0), read the result buffer,
 /// and if we have a faked entry for that inode, overlay it and write it back.
 pub fn patch_stat_result(pid: Pid, table: &OwnershipTable, kind: StatKind, buf: u64) -> Result<()> {
     // Default fakeroot semantics ("unknown is root"): every untracked file is
     // reported as owned by root, with its real mode/rdev/nlink preserved. Tracked
-    // inodes use their stored values. So we always overlay.
+    // inodes use their stored values. So we always overlay. (`HashMap::new()` in the
+    // default doesn't allocate, so this is cheap enough for the hot exit path.)
     let default = FakeNode::default();
     match kind {
         StatKind::Native => {
             let mut st: libc::stat = mem::read_struct(pid, buf)?;
-            let (dev, ino) = native_key(&st);
-            let node = table.get(dev, ino).unwrap_or(&default);
+            let node = table
+                .get(st.st_dev as u64, st.st_ino as u64)
+                .unwrap_or(&default);
             patch_native(&mut st, node);
             mem::write_struct(pid, buf, &st)?;
         }
         StatKind::Statx => {
             let mut stx: libc::statx = mem::read_struct(pid, buf)?;
-            let (dev, ino) = statx_key(&stx);
-            let node = table.get(dev, ino).unwrap_or(&default);
+            let dev = libc::makedev(stx.stx_dev_major, stx.stx_dev_minor) as u64;
+            let node = table.get(dev, stx.stx_ino).unwrap_or(&default);
             patch_statx(&mut stx, node);
             mem::write_struct(pid, buf, &stx)?;
         }
     }
     Ok(())
-}
-
-fn native_key(st: &libc::stat) -> (u64, u64) {
-    (st.st_dev as u64, st.st_ino as u64)
-}
-
-fn statx_key(stx: &libc::statx) -> (u64, u64) {
-    let dev = libc::makedev(stx.stx_dev_major, stx.stx_dev_minor);
-    (dev as u64, stx.stx_ino)
 }
 
 /// Overlay faked fields onto a kernel `struct stat`.
@@ -736,13 +719,26 @@ mod tests {
     }
 
     #[test]
-    fn classify_known_stat_calls() {
-        assert_eq!(classify_stat(libc::SYS_statx), Some((StatKind::Statx, 4)));
+    fn registry_classifies_known_syscalls() {
         assert_eq!(
-            classify_stat(libc::SYS_newfstatat),
-            Some((StatKind::Native, 2))
+            classify(libc::SYS_statx),
+            Some(Family::Stat(StatKind::Statx, 4))
         );
-        assert_eq!(classify_stat(libc::SYS_fstat), Some((StatKind::Native, 1)));
-        assert_eq!(classify_stat(libc::SYS_getpid), None);
+        assert_eq!(
+            classify(libc::SYS_newfstatat),
+            Some(Family::Stat(StatKind::Native, 2))
+        );
+        assert_eq!(classify(libc::SYS_fchown), Some(Family::Chown));
+        assert_eq!(classify(libc::SYS_capset), Some(Family::Cred));
+        assert_eq!(classify(libc::SYS_getpid), None);
+    }
+
+    #[test]
+    fn registry_has_no_duplicate_syscalls() {
+        let nums = trapped_syscalls();
+        let mut sorted = nums.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), nums.len(), "REGISTRY has duplicate syscalls");
     }
 }
