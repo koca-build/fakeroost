@@ -16,9 +16,7 @@ name = "fakeroot-rs"
 path = "src/main.rs"
 
 [dependencies]
-env_logger = "0.11.10"
 libc = "0.2.186"
-log = "0.4.33"
 nix = { version = "0.31.3", features = ["fs", "ptrace", "signal", "uio"] }
 seccompiler = "0.5.0"
 thiserror = "2.0.18"

@@ -1,31 +1,36 @@
 //! # fakeroot-rs
 //!
-//! A [`fakeroot`](https://wiki.debian.org/fakeroot)-style fake-root environment
-//! built on **ptrace** narrowed by a self-installed **seccomp `RET_TRACE`** filter.
+//! A [`fakeroot`](https://wiki.debian.org/fakeroot)-style fake-root environment for
+//! Linux, built on **ptrace** narrowed by a self-installed **seccomp `RET_TRACE`**
+//! filter. A program run under it believes it is root and sees whatever file
+//! ownership it sets, while nothing on disk is ever actually changed.
 //!
-//! Unlike the classic `LD_PRELOAD` fakeroot, this works for **statically linked**
-//! binaries (Go, musl, static Rust) because it intercepts at the syscall boundary,
-//! not the libc boundary. Unlike the user-namespace approach, it works under
-//! **Docker's default seccomp profile** with no extra privileges — installing a
-//! seccomp filter via `prctl` and ptracing your own children are both permitted
-//! there, whereas `clone(CLONE_NEWUSER)` is not.
+//! Unlike the classic `LD_PRELOAD` fakeroot it works for **statically linked**
+//! binaries (Go, musl, static Rust); unlike the user-namespace approach it works
+//! under **Docker's default seccomp profile** with no extra privileges.
 //!
 //! ## Usage
+//!
+//! Call [`init`] once at the top of `main` (see its docs for the why), then use
+//! [`FakerootCommandExt::fakeroot`] to run any [`Command`] under fakeroot:
 //!
 //! ```no_run
 //! use std::process::Command;
 //! use fakeroot::FakerootCommandExt;
 //!
-//! let status = Command::new("tar")
-//!     .args(["--numeric-owner", "-cf", "out.tar", "tree/"])
-//!     .fakeroot_status()?;
-//! assert!(status.success());
-//! # Ok::<(), fakeroot::Error>(())
+//! fn main() -> std::io::Result<()> {
+//!     fakeroot::init();
+//!
+//!     // Inside fakeroot the process believes it is root:
+//!     let out = Command::new("whoami").fakeroot().output()?;
+//!     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "root");
+//!     Ok(())
+//! }
 //! ```
 //!
-//! Inside the closure of the spawned process, `chown`/`chmod`/`mknod`/`stat`/`statx`
-//! and the credential syscalls are intercepted so the program believes it is root
-//! and sees the fake ownership it set.
+//! [`fakeroot`](FakerootCommandExt::fakeroot) returns a plain
+//! [`std::process::Command`], so it drops into any API that accepts one and stdio,
+//! pipes, `output()`/`spawn()`, and [`std::process::Child`] all work as usual.
 
 // Many `as u64`/`as u32` casts on libc struct fields are redundant on x86_64 but
 // required on aarch64 (e.g. `nlink_t` is u32 there). Keep them for portability.
@@ -40,93 +45,108 @@ mod path;
 mod supervisor;
 mod table;
 
-pub use error::{Error, Result};
-pub use supervisor::Options;
-
-use std::ffi::CString;
+use error::{Error, Result};
+use std::ffi::{CString, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::process::{Command, ExitStatus};
 use supervisor::Spawn;
 
-/// Extension trait adding fake-root execution to [`std::process::Command`].
-///
-/// Configure the command as usual (`.arg`, `.env`, `.current_dir`, …) and then run
-/// it under fakeroot. The supervisor must own the `waitpid` loop for the whole
-/// process tree, so these methods do **not** return a [`std::process::Child`];
-/// they run the command to completion (or hand back our own supervised handle).
-pub trait FakerootCommandExt {
-    /// Run the command under fakeroot on the calling thread, blocking until the
-    /// whole process tree exits, and return the root process's exit status.
-    fn fakeroot_status(&mut self) -> Result<ExitStatus>;
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for std::process::Command {}
+}
 
-    /// Like [`fakeroot_status`](Self::fakeroot_status), with explicit [`Options`].
-    fn fakeroot_status_with(&mut self, opts: Options) -> Result<ExitStatus>;
+/// Environment variable marking a process that was re-executed to act as the
+/// fakeroot supervisor. Set by [`FakerootCommandExt::fakeroot`], consumed by
+/// [`init`]. Internal — don't set or rely on it yourself.
+const SUPERVISE_VAR: &str = "__FAKEROOT_RS_SUPERVISE";
 
-    /// Run the command under fakeroot on a dedicated supervisor thread, returning a
-    /// handle. ptrace requires the tracer to be the thread that forked, so the
-    /// supervisor lives entirely on that thread; [`FakerootChild::wait`] retrieves
-    /// the exit status.
-    fn fakeroot_spawn(&mut self) -> Result<FakerootChild>;
+/// Adds fake-root execution to [`std::process::Command`].
+pub trait FakerootCommandExt: sealed::Sealed {
+    /// Rewrite this command so that running it executes the same program under
+    /// fakeroot, returning it as a plain [`std::process::Command`].
+    ///
+    /// The returned command re-executes the current program (see [`init`]) with
+    /// the original program, arguments, environment overrides and working directory
+    /// preserved. Run it however you like — `status()`, `output()`, `spawn()`, with
+    /// any stdio configuration — it behaves like a normal `Command`, just fake-rooted.
+    ///
+    /// Configure stdio (`.stdout`, pipes, …) on the **returned** command, not before:
+    /// `Command` exposes no way to read back its stdio, so any redirection set prior
+    /// to this call cannot be carried over.
+    fn fakeroot(&self) -> Command;
 }
 
 impl FakerootCommandExt for Command {
-    fn fakeroot_status(&mut self) -> Result<ExitStatus> {
-        self.fakeroot_status_with(Options::default())
-    }
-
-    fn fakeroot_status_with(&mut self, opts: Options) -> Result<ExitStatus> {
-        supervisor::run(&build_spawn(self)?, &opts)
-    }
-
-    fn fakeroot_spawn(&mut self) -> Result<FakerootChild> {
-        let spawn = build_spawn(self)?;
-        let handle = std::thread::spawn(move || supervisor::run(&spawn, &Options::default()));
-        Ok(FakerootChild { handle })
-    }
-}
-
-/// A handle to a command running under fakeroot on its own supervisor thread.
-pub struct FakerootChild {
-    handle: std::thread::JoinHandle<Result<ExitStatus>>,
-}
-
-impl FakerootChild {
-    /// Wait for the command (and its whole process tree) to finish.
-    pub fn wait(self) -> Result<ExitStatus> {
-        self.handle
-            .join()
-            .map_err(|_| Error::Other("fakeroot supervisor thread panicked".into()))?
-    }
-}
-
-/// Resolve a [`Command`] into the fully-specified [`Spawn`] the supervisor runs:
-/// program, argv, environment (current env with the command's overrides applied),
-/// and working directory.
-fn build_spawn(cmd: &Command) -> Result<Spawn> {
-    let nul = || Error::Other("command component contains a NUL byte".into());
-
-    let program = CString::new(cmd.get_program().as_bytes()).map_err(|_| nul())?;
-    let mut argv = vec![program.clone()];
-    for a in cmd.get_args() {
-        argv.push(CString::new(a.as_bytes()).map_err(|_| nul())?);
-    }
-
-    // Start from the current environment and apply the command's overrides.
-    // (env_clear is not observable through the std API, so it isn't supported.)
-    let mut env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
-        std::env::vars_os().collect();
-    for (k, v) in cmd.get_envs() {
-        match v {
-            Some(v) => {
-                env.insert(k.to_owned(), v.to_owned());
-            }
-            None => {
-                env.remove(k);
-            }
+    fn fakeroot(&self) -> Command {
+        // Re-exec ourselves via the kernel's magic symlink (resolved at exec time,
+        // so it needs no fallible `current_exe` lookup and survives a moved binary).
+        let mut cmd = Command::new("/proc/self/exe");
+        cmd.env(SUPERVISE_VAR, "1");
+        cmd.arg(self.get_program());
+        cmd.args(self.get_args());
+        for (key, val) in self.get_envs() {
+            match val {
+                Some(val) => cmd.env(key, val),
+                None => cmd.env_remove(key),
+            };
         }
+        if let Some(dir) = self.get_current_dir() {
+            cmd.current_dir(dir);
+        }
+        cmd
     }
-    let env = env
-        .into_iter()
+}
+
+/// Become the fakeroot supervisor if this process was launched as one — call this
+/// **once, as the first thing in `main`**.
+///
+/// ptrace requires the tracer to be a separate process from the traced one, so a
+/// command built by [`FakerootCommandExt::fakeroot`] doesn't run your target
+/// directly: it re-executes *your own program* in a supervisor mode. `init` is what
+/// detects that mode. On a normal launch it returns immediately and your program
+/// continues as usual; on a fakeroot re-exec it runs the supervisor over the
+/// requested command — owning the whole `waitpid` loop — and exits with that
+/// command's status code, never returning.
+///
+/// Re-executing your own binary (rather than a separate helper) means there is
+/// nothing extra to ship or locate at runtime. The price is this one line: if it is
+/// missing, or runs after other startup logic, a fake-rooted command re-runs that
+/// logic instead of the intended target.
+pub fn init() {
+    if std::env::var_os(SUPERVISE_VAR).is_none() {
+        return;
+    }
+    // We were re-executed as a supervisor: argv[1..] is the target command, and our
+    // environment/working directory are already what the child should inherit.
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let code = match supervise(&args) {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("fakeroot: {e}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+/// Build a [`Spawn`] for `args` (`[program, args…]`) from the current environment
+/// and run it under the supervisor.
+fn supervise(args: &[OsString]) -> Result<ExitStatus> {
+    let to_cstring = |s: &OsString| {
+        CString::new(s.as_bytes())
+            .map_err(|_| Error::Other("command component contains a NUL byte".into()))
+    };
+    let argv: Vec<CString> = args.iter().map(to_cstring).collect::<Result<_>>()?;
+    let program = argv
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::Other("no program given to fakeroot supervisor".into()))?;
+
+    // Inherit the current environment (the `.fakeroot()` command already applied any
+    // overrides to us), minus our own supervise marker.
+    let env = std::env::vars_os()
+        .filter(|(k, _)| k != SUPERVISE_VAR)
         .filter_map(|(k, v)| {
             let mut bytes = k.into_vec();
             bytes.push(b'=');
@@ -135,15 +155,5 @@ fn build_spawn(cmd: &Command) -> Result<Spawn> {
         })
         .collect();
 
-    let cwd = match cmd.get_current_dir() {
-        Some(d) => Some(CString::new(d.as_os_str().as_bytes()).map_err(|_| nul())?),
-        None => None,
-    };
-
-    Ok(Spawn {
-        program,
-        argv,
-        env,
-        cwd,
-    })
+    supervisor::run(&Spawn { program, argv, env })
 }

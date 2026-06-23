@@ -4,11 +4,13 @@
 //! deliberately minimal — the full `fakeroot`-compatible CLI (login shell,
 //! `-s/-i/-u/-b`, environment compatibility) is a separate effort.
 
-use fakeroot::{FakerootCommandExt, Options};
+use fakeroot::FakerootCommandExt;
 use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
-    env_logger::init();
+    // If we were re-executed as a supervisor, this runs the command and exits;
+    // otherwise it returns and we dispatch the CLI invocation below.
+    fakeroot::init();
 
     let mut args = std::env::args_os().skip(1);
     let Some(program) = args.next() else {
@@ -17,12 +19,7 @@ fn main() -> ExitCode {
     };
     let rest: Vec<_> = args.collect();
 
-    // Enable per-syscall debug instrumentation when RUST_LOG is set.
-    let opts = Options {
-        debug: std::env::var_os("RUST_LOG").is_some(),
-    };
-
-    match Command::new(program).args(rest).fakeroot_status_with(opts) {
+    match Command::new(program).args(rest).fakeroot().status() {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(e) => {
             eprintln!("fakeroot-rs: {e}");

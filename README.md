@@ -41,26 +41,43 @@ entries when an inode's last link goes away so reused inodes start clean.
 use std::process::Command;
 use fakeroot::FakerootCommandExt;
 
-// Build a tarball whose contents are owned by root, as an unprivileged user:
-let status = Command::new("tar")
-    .args(["--numeric-owner", "-cf", "out.tar", "tree/"])
-    .fakeroot_status()?;
-assert!(status.success());
-# Ok::<(), fakeroot::Error>(())
+fn main() -> std::io::Result<()> {
+    // Call once, first thing in main(). See note below.
+    fakeroot::init();
+
+    // Inside fakeroot the process believes it is root:
+    let out = Command::new("whoami").fakeroot().output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "root");
+    Ok(())
+}
 ```
 
-`FakerootCommandExt` adds to `std::process::Command`:
+`FakerootCommandExt::fakeroot()` returns a plain `std::process::Command` that runs
+the same program under fakeroot — so stdio, pipes, `status()`/`output()`/`spawn()`
+and `Child` all work exactly as with any `Command`, and it drops into any API that
+already accepts a `Command`:
 
-- `fakeroot_status()` / `fakeroot_status_with(Options)` — run to completion, return
-  the exit status (blocks on the calling thread).
-- `fakeroot_spawn()` — run on a dedicated supervisor thread, returning a
-  `FakerootChild` you `wait()` on.
+```rust
+let mut child = Command::new("make")
+    .arg("install")
+    .fakeroot()
+    .stdout(Stdio::piped())
+    .spawn()?;            // real Child: stream stdout, kill(), wait(), …
+```
+
+### Why `init()`?
+
+ptrace needs the tracer to be a separate process, so a `.fakeroot()` command runs
+your target by **re-executing your own program** in a supervisor mode rather than
+shipping a second binary. `fakeroot::init()` is the one line that detects that mode:
+it's a no-op on a normal launch, but on a fakeroot re-exec it runs the supervisor and
+exits without returning. Keep it at the very top of `main()`. Full details:
+[`fakeroot::init` on docs.rs](https://docs.rs/fakeroot-rs).
 
 ## CLI
 
 ```sh
 fakeroot-rs <program> [args...]      # run a command in a fake-root environment
-RUST_LOG=debug fakeroot-rs ...       # trace intercepted syscalls
 ```
 
 This is intentionally minimal. A full `fakeroot`-compatible CLI (login shell,

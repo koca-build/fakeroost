@@ -22,13 +22,6 @@ use std::ffi::CString;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 
-/// Knobs for a supervised run.
-#[derive(Debug, Default, Clone)]
-pub struct Options {
-    /// Emit per-syscall debug logging (also honors `RUST_LOG`).
-    pub debug: bool,
-}
-
 const PTRACE_OPTIONS: ptrace::Options = ptrace::Options::PTRACE_O_TRACESECCOMP
     .union(ptrace::Options::PTRACE_O_TRACEFORK)
     .union(ptrace::Options::PTRACE_O_TRACEVFORK)
@@ -45,25 +38,18 @@ pub struct Spawn {
     pub argv: Vec<CString>,
     /// Environment as `KEY=VALUE` entries.
     pub env: Vec<CString>,
-    /// Working directory to switch to before exec, if any.
-    pub cwd: Option<CString>,
 }
 
 /// Run `spawn` under fakeroot, blocking until the whole process tree exits.
 /// Returns the root process's exit status.
-pub fn run(spawn: &Spawn, opts: &Options) -> Result<ExitStatus> {
+pub fn run(spawn: &Spawn) -> Result<ExitStatus> {
     // Compile the filter in the parent (no allocation in the child).
     let bpf = filter::build()?;
 
     match unsafe { fork() }? {
         ForkResult::Child => {
-            // Async-signal context: keep to ptrace/prctl/chdir/exec only.
+            // Async-signal context: keep to ptrace/prctl/exec only.
             let _ = ptrace::traceme();
-            if let Some(cwd) = &spawn.cwd
-                && nix::unistd::chdir(cwd.as_c_str()).is_err()
-            {
-                unsafe { libc::_exit(125) };
-            }
             if filter::install(&bpf).is_err() {
                 unsafe { libc::_exit(126) };
             }
@@ -74,13 +60,12 @@ pub fn run(spawn: &Spawn, opts: &Options) -> Result<ExitStatus> {
             // execvpe only returns on failure.
             unsafe { libc::_exit(127) };
         }
-        ForkResult::Parent { child } => Supervisor::new(child, opts.clone()).event_loop(),
+        ForkResult::Parent { child } => Supervisor::new(child).event_loop(),
     }
 }
 
 struct Supervisor {
     root: Pid,
-    opts: Options,
     /// Tracees whose initial SIGSTOP we've already absorbed.
     initialized: HashSet<Pid>,
     /// Per-tracee action to apply when the stepped syscall reaches its exit stop.
@@ -91,10 +76,9 @@ struct Supervisor {
 }
 
 impl Supervisor {
-    fn new(root: Pid, opts: Options) -> Self {
+    fn new(root: Pid) -> Self {
         Supervisor {
             root,
-            opts,
             initialized: HashSet::new(),
             pending: HashMap::new(),
             table: OwnershipTable::default(),
@@ -153,10 +137,6 @@ impl Supervisor {
     /// which decide whether to pass it through, step to its exit, or skip it.
     fn on_seccomp(&mut self, pid: Pid) -> Result<()> {
         let mut regs = Regs::fetch(pid)?;
-        if self.opts.debug {
-            log::debug!("seccomp trap pid={pid} nr={}", regs.syscall_no());
-        }
-
         match handlers::handle_entry(pid, &mut self.table, &regs)? {
             Disposition::Passthrough => ptrace::cont(pid, None)?,
             Disposition::Step(action) => {
