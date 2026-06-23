@@ -44,7 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - run: cargo zigbuild clippy --target ${{ matrix.target }} --all-targets -- -D warnings
+      - run: cargo-zigbuild clippy --target ${{ matrix.target }} --all-targets -- -D warnings
 
   test:
     strategy:
@@ -67,5 +67,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - run: cargo zigbuild test --target ${{ matrix.target }} --all-targets
-      - run: cargo zigbuild test --target ${{ matrix.target }} --doc
+      - run: cargo-zigbuild test --target ${{ matrix.target }} --all-targets
+      - run: cargo-zigbuild test --target ${{ matrix.target }} --doc
