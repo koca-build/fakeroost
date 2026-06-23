@@ -1,6 +1,6 @@
 [package]
 name = "fakeroost"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "A fakeroot implementation using ptrace + seccomp. Works under Docker's default seccomp profile and fakes ownership for static binaries."
