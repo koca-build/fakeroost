@@ -78,6 +78,36 @@ This is intentionally minimal. A full `fakeroot`-compatible CLI (login shell,
   getter is still unstable. Avoid calling it on a `.fakeroot()` command; we can support
   it once that method stabilizes. (`env()` and `env_remove()` work fine.)
 
+## Contributing
+
+### Building and Testing
+
+```sh
+cargo build      # build the library and CLI
+cargo test       # run end-to-end tests (requires bash, coreutils, tar)
+```
+
+Tests run the real `fakeroost` binary against system tools, so they need a Linux
+environment with bash, coreutils, and tar installed.
+
+### Adding a New Architecture
+
+1. Add a new file under `src/arch/` (e.g., `riscv64.rs`)
+2. Implement the [`RegAccess`](src/arch/mod.rs) trait for the architecture's register file
+3. Add a new `#[cfg(target_arch = "...")]` branch in `src/arch/mod.rs`
+4. Update the compile error message in `src/arch/mod.rs` to include the new arch
+5. Update `src/filter.rs` `target_arch()` function to return the correct `seccompiler::TargetArch`
+6. Update the supported architectures list in this README
+
+The syscall numbers and struct layouts are provided by the `libc` crate (cfg-gated
+to the build target), so only the register access code needs to be architecture-specific.
+
+### Debugging
+
+- Use `strace -f` on the supervised command to see syscalls being intercepted
+- Check `/proc/<pid>/status` for ptrace state of running processes
+- Build with `cargo build` and run tests with `cargo test` to verify the implementation
+
 ## License
 
 MIT
