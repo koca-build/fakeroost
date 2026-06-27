@@ -133,7 +133,7 @@ impl Supervisor {
     /// which decide whether to pass it through, step to its exit, or skip it.
     fn on_seccomp(&mut self, pid: Pid) -> Result<()> {
         let mut regs = Regs::fetch(pid)?;
-        match handlers::handle_entry(pid, &mut self.table, &regs)? {
+        match handlers::handle_entry(pid, &self.table, &regs)? {
             Disposition::Passthrough => ptrace::cont(pid, None)?,
             Disposition::Step(action) => {
                 self.pending.insert(pid, action);
@@ -155,7 +155,7 @@ impl Supervisor {
             return Ok(());
         };
         let mut regs = Regs::fetch(pid)?;
-        handlers::apply_exit_action(pid, &mut self.table, action, &mut regs)?;
+        handlers::apply_exit_action(pid, &self.table, action, &mut regs)?;
         Ok(())
     }
 
