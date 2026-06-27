@@ -96,15 +96,11 @@ impl Supervisor {
             };
 
             match status {
-                WaitStatus::Exited(pid, code) => {
-                    if pid == self.root {
-                        self.root_status = Some(ExitStatus::from_raw((code & 0xff) << 8));
-                    }
+                WaitStatus::Exited(pid, code) if pid == self.root => {
+                    self.root_status = Some(ExitStatus::from_raw((code & 0xff) << 8));
                 }
-                WaitStatus::Signaled(pid, sig, _core) => {
-                    if pid == self.root {
-                        self.root_status = Some(ExitStatus::from_raw(sig as i32 & 0x7f));
-                    }
+                WaitStatus::Signaled(pid, sig, _core) if pid == self.root => {
+                    self.root_status = Some(ExitStatus::from_raw(sig as i32 & 0x7f));
                 }
                 WaitStatus::PtraceEvent(pid, _sig, event) => self.on_event(pid, event)?,
                 WaitStatus::PtraceSyscall(pid) => {
