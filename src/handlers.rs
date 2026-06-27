@@ -277,16 +277,22 @@ fn handle_chown(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> R
     Ok(Disposition::Skip(ExitAction::ForceRet(0)))
 }
 
-/// Resolve a chown-family syscall to `(target inode, uid, gid)`.
+/// Resolve a chown-family syscall to `(target inode, uid, gid)`. A target that
+/// can't be stat'd (gone, ENOTDIR, bad fd) yields `None` so the real syscall runs
+/// and returns the natural errno to the caller — never abort the supervised tree.
 fn chown_target(pid: Pid, nr: i64, regs: &Regs) -> Result<Option<(path::RealStat, u32, u32)>> {
     #[cfg(target_arch = "x86_64")]
     if nr == libc::SYS_chown || nr == libc::SYS_lchown {
         let path = read_path(pid, regs.arg(0))?;
-        let rs = path::stat_target(pid, AT_FDCWD, &path, nr == libc::SYS_lchown, false)?;
+        let Ok(rs) = path::stat_target(pid, AT_FDCWD, &path, nr == libc::SYS_lchown, false) else {
+            return Ok(None);
+        };
         return Ok(Some((rs, regs.arg(1) as u32, regs.arg(2) as u32)));
     }
     if nr == libc::SYS_fchown {
-        let rs = path::stat_target(pid, regs.arg(0) as i32, Path::new(""), false, true)?;
+        let Ok(rs) = path::stat_target(pid, regs.arg(0) as i32, Path::new(""), false, true) else {
+            return Ok(None);
+        };
         return Ok(Some((rs, regs.arg(1) as u32, regs.arg(2) as u32)));
     }
     if nr == libc::SYS_fchownat {
@@ -294,7 +300,9 @@ fn chown_target(pid: Pid, nr: i64, regs: &Regs) -> Result<Option<(path::RealStat
         let flags = regs.arg(4) as i32;
         let nofollow = flags & libc::AT_SYMLINK_NOFOLLOW != 0;
         let empty = flags & libc::AT_EMPTY_PATH != 0;
-        let rs = path::stat_target(pid, regs.arg(0) as i32, &path, nofollow, empty)?;
+        let Ok(rs) = path::stat_target(pid, regs.arg(0) as i32, &path, nofollow, empty) else {
+            return Ok(None);
+        };
         return Ok(Some((rs, regs.arg(2) as u32, regs.arg(3) as u32)));
     }
     Ok(None)
@@ -310,22 +318,29 @@ fn handle_chmod(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> R
     Ok(Disposition::Step(ExitAction::ZeroOnErr))
 }
 
-/// Resolve a chmod-family syscall to `(target inode, requested mode)`.
+/// Resolve a chmod-family syscall to `(target inode, requested mode)`. As with
+/// chown, an unstattable target yields `None` so the real syscall runs.
 fn chmod_target(pid: Pid, nr: i64, regs: &Regs) -> Result<Option<(path::RealStat, u32)>> {
     #[cfg(target_arch = "x86_64")]
     if nr == libc::SYS_chmod {
         let path = read_path(pid, regs.arg(0))?;
-        let rs = path::stat_target(pid, AT_FDCWD, &path, false, false)?;
+        let Ok(rs) = path::stat_target(pid, AT_FDCWD, &path, false, false) else {
+            return Ok(None);
+        };
         return Ok(Some((rs, regs.arg(1) as u32)));
     }
     if nr == libc::SYS_fchmod {
-        let rs = path::stat_target(pid, regs.arg(0) as i32, Path::new(""), false, true)?;
+        let Ok(rs) = path::stat_target(pid, regs.arg(0) as i32, Path::new(""), false, true) else {
+            return Ok(None);
+        };
         return Ok(Some((rs, regs.arg(1) as u32)));
     }
     if nr == libc::SYS_fchmodat {
         let path = read_path(pid, regs.arg(1))?;
         let nofollow = regs.arg(3) as i32 & libc::AT_SYMLINK_NOFOLLOW != 0;
-        let rs = path::stat_target(pid, regs.arg(0) as i32, &path, nofollow, false)?;
+        let Ok(rs) = path::stat_target(pid, regs.arg(0) as i32, &path, nofollow, false) else {
+            return Ok(None);
+        };
         return Ok(Some((rs, regs.arg(2) as u32)));
     }
     Ok(None)
@@ -362,14 +377,22 @@ fn finish_mknod(
     dev: u64,
 ) -> Result<Disposition> {
     use std::os::unix::fs::OpenOptionsExt;
-    // Create the placeholder as a normal file (best-effort; ignore EEXIST).
-    let _ = std::fs::OpenOptions::new()
+    // Create the placeholder as a normal file (existing file is fine). If the path
+    // is unusable (e.g. a trailing-slash autoconf probe), pass the syscall through
+    // so the kernel returns the real errno — never abort the supervised tree.
+    if std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o644)
-        .open(resolved);
-    let st = nix::sys::stat::stat(resolved)?;
+        .open(resolved)
+        .is_err()
+    {
+        return Ok(Disposition::Passthrough);
+    }
+    let Ok(st) = nix::sys::stat::stat(resolved) else {
+        return Ok(Disposition::Passthrough);
+    };
     let node = table.entry(st.st_dev as u64, st.st_ino as u64);
     // A node created while we pretend to be root is root-owned.
     node.uid = 0;
