@@ -17,6 +17,10 @@ fn target_arch() -> seccompiler::TargetArch {
     {
         seccompiler::TargetArch::aarch64
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        seccompiler::TargetArch::riscv64
+    }
 }
 
 /// Compile the seccomp filter that traps the handlers' registry of syscalls with
