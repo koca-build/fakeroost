@@ -11,6 +11,7 @@ mod mem;
 mod path;
 mod supervisor;
 mod table;
+mod user_notif;
 
 use error::{Error, Result};
 use std::ffi::{CString, OsString};

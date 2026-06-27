@@ -94,7 +94,7 @@ pub enum Family {
 /// bare numbers don't exist there. That (and only that) is why those rows are
 /// `#[cfg]`-gated to x86_64; it's the one place this arch knowledge lives.
 #[rustfmt::skip]
-const REGISTRY: &[(i64, Family)] = &[
+pub(crate) const REGISTRY: &[(i64, Family)] = &[
     // stat family (kept first — by far the most frequently trapped)
     #[cfg(target_arch = "x86_64")] (libc::SYS_stat,  Family::Stat(StatKind::Native, 1)),
     #[cfg(target_arch = "x86_64")] (libc::SYS_lstat, Family::Stat(StatKind::Native, 1)),
@@ -153,7 +153,8 @@ const REGISTRY: &[(i64, Family)] = &[
     (libc::SYS_fremovexattr, Family::Xattr),
 ];
 
-/// The syscalls to trap with seccomp `RET_TRACE`, derived from [`REGISTRY`].
+/// The syscalls to trap, derived from [`REGISTRY`].
+#[allow(dead_code)]
 pub(crate) fn trapped_syscalls() -> Vec<i64> {
     REGISTRY.iter().map(|&(nr, _)| nr).collect()
 }
@@ -445,7 +446,12 @@ fn handle_xattr(pid: Pid, table: &OwnershipTable, nr: i64, regs: &Regs) -> Resul
         if size > 0 {
             mem::read(pid, regs.arg(2), &mut value)?;
         }
-        table.write().entry((rs.dev, rs.ino)).or_default().xattrs.insert(name, value);
+        table
+            .write()
+            .entry((rs.dev, rs.ino))
+            .or_default()
+            .xattrs
+            .insert(name, value);
         return Ok(Disposition::Skip(ExitAction::ForceRet(0)));
     }
 
@@ -493,7 +499,12 @@ fn handle_xattr(pid: Pid, table: &OwnershipTable, nr: i64, regs: &Regs) -> Resul
     if nr == libc::SYS_removexattr || nr == libc::SYS_lremovexattr || nr == libc::SYS_fremovexattr {
         let rs = xattr_target(pid, nr, regs)?;
         let name = CString::new(mem::read_cstring(pid, regs.arg(1))?).unwrap_or_default();
-        table.write().entry((rs.dev, rs.ino)).or_default().xattrs.remove(&name);
+        table
+            .write()
+            .entry((rs.dev, rs.ino))
+            .or_default()
+            .xattrs
+            .remove(&name);
         return Ok(Disposition::Skip(ExitAction::ForceRet(0)));
     }
 
