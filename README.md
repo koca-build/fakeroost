@@ -66,7 +66,7 @@ This is intentionally minimal. A full `fakeroot`-compatible CLI (login shell,
 
 - **Linux only.** Requires unprivileged ptrace of own children (default in most
   environments, including default-seccomp Docker).
-- **Architectures:** `x86_64` (amd64) and `aarch64` (arm64).
+- **Architectures:** `x86_64` (amd64), `aarch64` (arm64), and `riscv64`.
 
 ## Limitations
 

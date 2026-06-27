@@ -6,7 +6,7 @@
 //! `offset_of!(libc::statx, …)`. The only genuinely per-arch code is reading and
 //! writing the register file at a ptrace stop — that lives here.
 //!
-//! Supported architectures: `x86_64` (amd64) and `aarch64` (arm64).
+//! Supported architectures: `x86_64` (amd64), `aarch64` (arm64), and `riscv64`.
 
 use crate::error::Result;
 use nix::unistd::Pid;
@@ -17,9 +17,16 @@ mod imp;
 #[cfg(target_arch = "aarch64")]
 #[path = "aarch64.rs"]
 mod imp;
+#[cfg(target_arch = "riscv64")]
+#[path = "riscv64.rs"]
+mod imp;
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-compile_error!("fakeroost supports only x86_64 (amd64) and aarch64 (arm64)");
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+)))]
+compile_error!("fakeroost supports only x86_64 (amd64), aarch64 (arm64), and riscv64");
 
 pub use imp::Regs;
 
