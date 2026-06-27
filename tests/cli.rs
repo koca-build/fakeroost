@@ -101,3 +101,19 @@ fn real_filesystem_is_untouched() {
     let file_uid = std::fs::metadata(dir.path().join("realf")).unwrap().uid();
     assert_eq!(file_uid, real_uid, "fakeroot must not really chown on disk");
 }
+
+#[test]
+fn bad_path_syscall_does_not_abort_supervisor() {
+    // A mknod/chown/chmod on an unusable path (e.g. a trailing-slash target, as
+    // autoconf/gnulib probes routinely issue) must hand the error back to the
+    // caller, not error out of a handler and tear down the whole traced tree.
+    let dir = TempDir::new().unwrap();
+    let out = fakeroot_sh(
+        dir.path(),
+        "mkfifo conftest.fifo/ 2>/dev/null; \
+         chown 1:1 conftest.missing 2>/dev/null; \
+         chmod 0644 conftest.missing 2>/dev/null; \
+         echo survived",
+    );
+    assert_eq!(out.trim(), "survived");
+}
