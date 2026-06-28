@@ -39,36 +39,67 @@ trap 'rm -rf "$workdir"' EXIT
 for ((i = 0; i < 512; i++)); do echo "$i" > "$workdir/f$i"; done
 
 rate() { # <label> <workers>  -> prints rate
-    if [[ "$1" == "native" ]]; then
-        "$helper" "$n_stat_native" "$2" "$workdir" 2>&1 >/dev/null
-    else
-        "$target" "$helper" "$n_stat_fake" "$2" "$workdir" 2>&1 >/dev/null
-    fi | sed -n 's/.*rate=\([0-9.]*\).*/\1/p'
+    case "$1" in
+        native)    "$helper"            "$n_stat_native" "$2" "$workdir" 2>&1 >/dev/null ;;
+        fakeroost) "$target"            "$helper" "$n_stat_fake" "$2" "$workdir" 2>&1 >/dev/null ;;
+        fakeroot)  fakeroot -- "$helper" "$n_stat_fake" "$2" "$workdir" 2>&1 >/dev/null ;;
+    esac | sed -n 's/.*rate=\([0-9.]*\).*/\1/p'
 }
 
-fmt() { printf "%9s %16s %18s\n" "$@"; }
+fmt() { printf "$1"; shift; printf '%s' ""; printf '%16s' "$@"; printf '\n'; }
 
-declare -a Rn Rf
-base_n="" base_f=""
+# Original C fakeroot, when installed — an extra real-world baseline.
+have_fakeroot=0
+if command -v fakeroot >/dev/null 2>&1; then
+    have_fakeroot=1
+else
+    echo "# (fakeroot not installed; skipping that column)" >&2
+fi
+
+fetch() { # <label> <workers>  -> rate (empty if label is fakeroot and unavailable)
+    if [[ "$1" == fakeroot && "$have_fakeroot" -eq 0 ]]; then printf ''; return; fi
+    rate "$1" "$2"
+}
+
+declare -a Rn Rf Rk
+base_n="" base_f="" base_k=""
 for i in "${!workers[@]}"; do
     nw="${workers[$i]}"
     Rn[$i]="$(rate native "$nw")"
     Rf[$i]="$(rate fakeroost "$nw")"
+    Rk[$i]="$(fetch fakeroot "$nw")"
     [[ -z "$base_n" ]] && base_n="${Rn[$i]}"
     [[ -z "$base_f" ]] && base_f="${Rf[$i]}"
+    [[ -z "$base_k" ]] && base_k="${Rk[$i]}"
 done
 
+col_fakeroot=''
+if [[ "$have_fakeroot" -eq 1 ]]; then col_fakeroot='rate_fakeroot/s'; fi
+
 echo "# fakeroost serialization benchmark (issue #7)"
-echo "# n_calls_per_worker: native=$n_stat_native fakeroost=$n_stat_fake  cores=$cores"
+echo "# n_calls_per_worker: native=$n_stat_native fakeroost/fakeroot=$n_stat_fake  cores=$cores"
 echo "#"
-fmt "workers" "rate_native/s" "rate_fakeroost/s"
-for i in "${!workers[@]}"; do fmt "${workers[$i]}" "${Rn[$i]}" "${Rf[$i]}"; done
+printf '%9s %16s %18s' 'workers' 'rate_native/s' 'rate_fakeroost/s'
+if [[ "$have_fakeroot" -eq 1 ]]; then printf ' %16s' 'rate_fakeroot/s'; fi
+printf '\n'
+for i in "${!workers[@]}"; do
+    printf '%9s %16s %18s' "${workers[$i]}" "${Rn[$i]}" "${Rf[$i]}"
+    if [[ "$have_fakeroot" -eq 1 ]]; then printf ' %16s' "${Rk[$i]}"; fi
+    printf '\n'
+done
 
 echo "#"
 echo "# effective parallelism (rate_w / rate_w1):"
-fmt "workers" "native_x" "fakeroost_x"
+printf '%9s %16s %18s' 'workers' 'native_x' 'fakeroost_x'
+if [[ "$have_fakeroot" -eq 1 ]]; then printf ' %16s' 'fakeroot_x'; fi
+printf '\n'
 for i in "${!workers[@]}"; do
     sn="$(awk -v a="${Rn[$i]}" -v b="$base_n" 'BEGIN{printf "%.1f", a/b}')"
     sf="$(awk -v a="${Rf[$i]}" -v b="$base_f" 'BEGIN{printf "%.2f", a/b}')"
-    fmt "${workers[$i]}" "$sn" "$sf"
+    printf '%9s %16s %18s' "${workers[$i]}" "$sn" "$sf"
+    if [[ "$have_fakeroot" -eq 1 ]]; then
+        sk="$(awk -v a="${Rk[$i]}" -v b="$base_k" 'BEGIN{printf "%.2f", a/b}')"
+        printf ' %16s' "$sk"
+    fi
+    printf '\n'
 done
