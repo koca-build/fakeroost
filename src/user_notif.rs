@@ -87,7 +87,7 @@ impl NotifPool {
 fn worker(fd: std::os::fd::RawFd, table: Arc<OwnershipTable>) {
     loop {
         let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
-        let r = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as libc::c_ulong, &mut req) };
+        let r = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as libc::Ioctl, &mut req) };
         if r != 0 {
             break; // listener closed or fatal error → exit
         }
@@ -107,7 +107,7 @@ fn worker(fd: std::os::fd::RawFd, table: Arc<OwnershipTable>) {
         };
         // Best-effort: if the tracee died between RECV and SEND, the id is stale
         // and SEND fails — there's nothing to do but move on.
-        let _ = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as libc::c_ulong, &resp) };
+        let _ = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as libc::Ioctl, &resp) };
     }
 }
 
