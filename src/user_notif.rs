@@ -135,6 +135,12 @@ fn do_stat(resolved: &Path, nofollow: bool) -> std::io::Result<libc::stat> {
 }
 
 /// Supervisor-side `statx` of an already-resolved path.
+///
+/// Called via the raw `SYS_statx` syscall rather than the glibc `statx()` wrapper,
+/// because the wrapper only exists in glibc ≥ 2.28 and the release build targets
+/// glibc 2.17 for old-distro compatibility. The kernel syscall itself is present
+/// on any kernel that supports USER_NOTIF (Linux 5.0+), so the wrapper is not
+/// needed at runtime either.
 fn do_statx(resolved: &Path, nofollow: bool, mask: u32) -> std::io::Result<libc::statx> {
     let c = CString::new(resolved.as_os_str().as_bytes())?;
     let mut stx: libc::statx = unsafe { std::mem::zeroed() };
@@ -143,7 +149,16 @@ fn do_statx(resolved: &Path, nofollow: bool, mask: u32) -> std::io::Result<libc:
     } else {
         0
     };
-    let rc = unsafe { libc::statx(libc::AT_FDCWD, c.as_ptr(), flags, mask, &mut stx) };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            flags,
+            mask,
+            &mut stx,
+        )
+    };
     if rc != 0 {
         Err(std::io::Error::last_os_error())
     } else {
