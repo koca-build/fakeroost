@@ -94,7 +94,7 @@ pub enum Family {
 /// bare numbers don't exist there. That (and only that) is why those rows are
 /// `#[cfg]`-gated to x86_64; it's the one place this arch knowledge lives.
 #[rustfmt::skip]
-const REGISTRY: &[(i64, Family)] = &[
+pub(crate) const REGISTRY: &[(i64, Family)] = &[
     // stat family (kept first — by far the most frequently trapped)
     #[cfg(target_arch = "x86_64")] (libc::SYS_stat,  Family::Stat(StatKind::Native, 1)),
     #[cfg(target_arch = "x86_64")] (libc::SYS_lstat, Family::Stat(StatKind::Native, 1)),
@@ -153,7 +153,8 @@ const REGISTRY: &[(i64, Family)] = &[
     (libc::SYS_fremovexattr, Family::Xattr),
 ];
 
-/// The syscalls to trap with seccomp `RET_TRACE`, derived from [`REGISTRY`].
+/// The syscalls to trap, derived from [`REGISTRY`].
+#[allow(dead_code)]
 pub(crate) fn trapped_syscalls() -> Vec<i64> {
     REGISTRY.iter().map(|&(nr, _)| nr).collect()
 }
@@ -166,7 +167,7 @@ fn classify(nr: i64) -> Option<Family> {
 
 /// Inspect a trapped syscall at its entry (seccomp) stop and decide what to do.
 /// May record fake ownership in `table`.
-pub fn handle_entry(pid: Pid, table: &mut OwnershipTable, regs: &Regs) -> Result<Disposition> {
+pub fn handle_entry(pid: Pid, table: &OwnershipTable, regs: &Regs) -> Result<Disposition> {
     let nr = regs.syscall_no();
     let Some(family) = classify(nr) else {
         return Ok(Disposition::Passthrough);
@@ -258,8 +259,9 @@ fn read_path(pid: Pid, addr: u64) -> Result<PathBuf> {
 /// Record the requested ownership against the resolved inode. New entries seed
 /// from the fake-current owner (root, `0:0`), so a partial chown (`-1` for one id)
 /// keeps the *fake* current value — matching fakeroot's "unknown is root" model.
-fn record_chown(table: &mut OwnershipTable, rs: &path::RealStat, uid: u32, gid: u32) {
-    let node = table.entry(rs.dev, rs.ino);
+fn record_chown(table: &OwnershipTable, rs: &path::RealStat, uid: u32, gid: u32) {
+    let mut map = table.write();
+    let node = map.entry((rs.dev, rs.ino)).or_default();
     if uid != ID_UNCHANGED {
         node.uid = uid;
     }
@@ -269,7 +271,7 @@ fn record_chown(table: &mut OwnershipTable, rs: &path::RealStat, uid: u32, gid: 
 }
 
 /// chown/lchown/fchown/fchownat — record the fake owner, skip the real call.
-fn handle_chown(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
+fn handle_chown(pid: Pid, table: &OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
     let Some((rs, uid, gid)) = chown_target(pid, nr, regs)? else {
         return Ok(Disposition::Passthrough);
     };
@@ -310,7 +312,7 @@ fn chown_target(pid: Pid, nr: i64, regs: &Regs) -> Result<Option<(path::RealStat
 
 /// chmod/fchmod/fchmodat — record the fake mode but let the real call run so the
 /// on-disk permission bits update when the user is allowed to set them.
-fn handle_chmod(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
+fn handle_chmod(pid: Pid, table: &OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
     let Some((rs, req_mode)) = chmod_target(pid, nr, regs)? else {
         return Ok(Disposition::Passthrough);
     };
@@ -346,15 +348,15 @@ fn chmod_target(pid: Pid, nr: i64, regs: &Regs) -> Result<Option<(path::RealStat
     Ok(None)
 }
 
-fn record_chmod(table: &mut OwnershipTable, rs: &path::RealStat, req_mode: u32) {
+fn record_chmod(table: &OwnershipTable, rs: &path::RealStat, req_mode: u32) {
     let mode = compose_mode(rs.mode, req_mode);
-    table.entry(rs.dev, rs.ino).mode = Some(mode);
+    table.write().entry((rs.dev, rs.ino)).or_default().mode = Some(mode);
 }
 
 /// mknod/mknodat — we can't create real device nodes unprivileged, so drop a
 /// regular placeholder file and record the intended type + rdev so `stat` reports
 /// a device node (and archivers store one).
-fn handle_mknod(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
+fn handle_mknod(pid: Pid, table: &OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
     #[cfg(target_arch = "x86_64")]
     if nr == libc::SYS_mknod {
         let p = read_path(pid, regs.arg(0))?;
@@ -371,7 +373,7 @@ fn handle_mknod(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> R
 }
 
 fn finish_mknod(
-    table: &mut OwnershipTable,
+    table: &OwnershipTable,
     resolved: &Path,
     mode: u32,
     dev: u64,
@@ -393,7 +395,8 @@ fn finish_mknod(
     let Ok(st) = nix::sys::stat::stat(resolved) else {
         return Ok(Disposition::Passthrough);
     };
-    let node = table.entry(st.st_dev as u64, st.st_ino as u64);
+    let mut map = table.write();
+    let node = map.entry((st.st_dev as u64, st.st_ino as u64)).or_default();
     // A node created while we pretend to be root is root-owned.
     node.uid = 0;
     node.gid = 0;
@@ -431,7 +434,7 @@ fn xattr_target(pid: Pid, nr: i64, regs: &Regs) -> Result<path::RealStat> {
 
 /// Fake xattrs in the table. Crucial for `security.capability` and POSIX ACLs,
 /// which a non-root process can't really set but packagers need archived.
-fn handle_xattr(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
+fn handle_xattr(pid: Pid, table: &OwnershipTable, nr: i64, regs: &Regs) -> Result<Disposition> {
     const MAX_XATTR: usize = 64 * 1024;
 
     // set*xattr(target, name, value, size, flags)
@@ -443,7 +446,12 @@ fn handle_xattr(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> R
         if size > 0 {
             mem::read(pid, regs.arg(2), &mut value)?;
         }
-        table.entry(rs.dev, rs.ino).xattrs.insert(name, value);
+        table
+            .write()
+            .entry((rs.dev, rs.ino))
+            .or_default()
+            .xattrs
+            .insert(name, value);
         return Ok(Disposition::Skip(ExitAction::ForceRet(0)));
     }
 
@@ -451,11 +459,17 @@ fn handle_xattr(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> R
     if nr == libc::SYS_getxattr || nr == libc::SYS_lgetxattr || nr == libc::SYS_fgetxattr {
         let rs = xattr_target(pid, nr, regs)?;
         let name = CString::new(mem::read_cstring(pid, regs.arg(1))?).unwrap_or_default();
-        if let Some(value) = table.get(rs.dev, rs.ino).and_then(|n| n.xattrs.get(&name)) {
+        let hit = {
+            let map = table.read();
+            map.get(&(rs.dev, rs.ino))
+                .and_then(|n| n.xattrs.get(&name))
+                .cloned()
+        };
+        if let Some(value) = hit {
             return Ok(Disposition::Skip(ExitAction::ReturnXattr {
                 buf: regs.arg(2),
                 size: regs.arg(3),
-                value: value.clone(),
+                value,
             }));
         }
         // Not faked — let the real xattr (e.g. user.*) through.
@@ -465,10 +479,12 @@ fn handle_xattr(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> R
     // list*xattr(target, list, size)
     if nr == libc::SYS_listxattr || nr == libc::SYS_llistxattr || nr == libc::SYS_flistxattr {
         let rs = xattr_target(pid, nr, regs)?;
-        let extra: Vec<Vec<u8>> = table
-            .get(rs.dev, rs.ino)
-            .map(|n| n.xattrs.keys().map(|k| k.as_bytes().to_vec()).collect())
-            .unwrap_or_default();
+        let extra: Vec<Vec<u8>> = {
+            let map = table.read();
+            map.get(&(rs.dev, rs.ino))
+                .map(|n| n.xattrs.keys().map(|k| k.as_bytes().to_vec()).collect())
+                .unwrap_or_default()
+        };
         if extra.is_empty() {
             return Ok(Disposition::Passthrough);
         }
@@ -483,7 +499,12 @@ fn handle_xattr(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> R
     if nr == libc::SYS_removexattr || nr == libc::SYS_lremovexattr || nr == libc::SYS_fremovexattr {
         let rs = xattr_target(pid, nr, regs)?;
         let name = CString::new(mem::read_cstring(pid, regs.arg(1))?).unwrap_or_default();
-        table.entry(rs.dev, rs.ino).xattrs.remove(&name);
+        table
+            .write()
+            .entry((rs.dev, rs.ino))
+            .or_default()
+            .xattrs
+            .remove(&name);
         return Ok(Disposition::Skip(ExitAction::ForceRet(0)));
     }
 
@@ -493,7 +514,7 @@ fn handle_xattr(pid: Pid, table: &mut OwnershipTable, nr: i64, regs: &Regs) -> R
 /// Apply an [`ExitAction`] at a syscall-exit stop.
 pub fn apply_exit_action(
     pid: Pid,
-    table: &mut OwnershipTable,
+    table: &OwnershipTable,
     action: ExitAction,
     regs: &mut Regs,
 ) -> Result<()> {
@@ -576,7 +597,7 @@ pub fn apply_exit_action(
             // Only drop the entry once the inode is truly gone (last link removed
             // / directory removed). Hardlinked files keep their fake ownership.
             if regs.ret() == 0 && nlink_before <= 1 {
-                table.remove(dev, ino);
+                table.write().remove(&(dev, ino));
             }
         }
     }
@@ -603,17 +624,23 @@ pub fn patch_stat_result(pid: Pid, table: &OwnershipTable, kind: StatKind, buf: 
     match kind {
         StatKind::Native => {
             let mut st: libc::stat = mem::read_struct(pid, buf)?;
-            let node = table
-                .get(st.st_dev as u64, st.st_ino as u64)
-                .unwrap_or(&default);
-            patch_native(&mut st, node);
+            {
+                let map = table.read();
+                let node = map
+                    .get(&(st.st_dev as u64, st.st_ino as u64))
+                    .unwrap_or(&default);
+                patch_native(&mut st, node);
+            }
             mem::write_struct(pid, buf, &st)?;
         }
         StatKind::Statx => {
             let mut stx: libc::statx = mem::read_struct(pid, buf)?;
             let dev = libc::makedev(stx.stx_dev_major, stx.stx_dev_minor) as u64;
-            let node = table.get(dev, stx.stx_ino).unwrap_or(&default);
-            patch_statx(&mut stx, node);
+            {
+                let map = table.read();
+                let node = map.get(&(dev, stx.stx_ino)).unwrap_or(&default);
+                patch_statx(&mut stx, node);
+            }
             mem::write_struct(pid, buf, &stx)?;
         }
     }

@@ -1,0 +1,9 @@
+[package]
+name = "stat-loop"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "stat-loop"
+path = "src/main.rs"
